@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict
 from contextlib import nullcontext
+from torch.utils.checkpoint import checkpoint
 
 from .config import TrainingConfig, FeatureFlags
 from .layer import DLSMNLayer
@@ -449,8 +450,10 @@ class DLSMN_ARC(nn.Module):
             test_h = h[:, test_start_idx:]
             pass_logits = self.output_proj(test_h).view(B, H, W, -1)
             
-            if 'pass_logits' not in aux_data: aux_data['pass_logits'] = []
-            aux_data['pass_logits'].append(pass_logits)
+            # Only store pass_logits if deep supervision enabled (memory optimization)
+            if features.use_deep_supervision:
+                if 'pass_logits' not in aux_data: aux_data['pass_logits'] = []
+                aux_data['pass_logits'].append(pass_logits)
             
             prev_answer = pass_logits.detach().argmax(dim=-1)
             

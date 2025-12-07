@@ -42,6 +42,7 @@ def train_epoch(
     global_step: int = 0,
     writer: Optional[SummaryWriter] = None,
     log_interval: int = 10,
+    grad_accum_steps: int = 1,
 ) -> Tuple[float, float, float, int]:
     """
     Training epoch with simplified loss.
@@ -64,7 +65,9 @@ def train_epoch(
         output_mask = batch["output_mask"].to(device)
         output_size = batch["output_size"].to(device)
         
-        optimizer.zero_grad()
+        # Only zero grad at accumulation boundaries
+        if batch_idx % grad_accum_steps == 0:
+            optimizer.zero_grad()
         
         # Forward pass with training config
         logits, size_logits, cache, aux_info = model(
@@ -80,9 +83,14 @@ def train_epoch(
             aux_info, config, global_step, device
         )
         
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        # Scale loss for gradient accumulation
+        scaled_loss = loss / grad_accum_steps
+        scaled_loss.backward()
+        
+        # Only step optimizer at accumulation boundaries
+        if (batch_idx + 1) % grad_accum_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
         
         # === CRITICAL: Memory cleanup to prevent graph accumulation ===
         loss_val = loss.detach().item()
@@ -174,9 +182,12 @@ def train_epoch(
                 val.clear()
         aux_info.clear()
         
-        # Force MPS cache clear every 10 batches
-        if device.type == 'mps' and batch_idx % 10 == 0:
-            torch.mps.empty_cache()
+        # Force cache clear every 10 batches
+        if batch_idx % 10 == 0:
+            if device.type == 'mps':
+                torch.mps.empty_cache()
+            elif device.type == 'cuda':
+                torch.cuda.empty_cache()
     
     return total_loss / len(dataloader), cell_acc, task_acc, global_step
 
@@ -263,6 +274,18 @@ def main():
         batch_size = 8
         max_passes = 4
         max_recurrent_steps = 2
+    elif preset_name == "runpod":
+        # Optimized for ~44GB GPU (A40, A100-40GB, etc.)
+        max_grid_size = 30
+        d_model = 128
+        d_cache = 64
+        num_layers = 3
+        num_slots = 12
+        num_patterns = 12
+        num_heads = 4
+        batch_size = 4  # Conservative for memory
+        max_passes = 4
+        max_recurrent_steps = 2
     elif preset_name == "full":
         max_grid_size = 30
         d_model = 128
@@ -271,7 +294,7 @@ def main():
         num_slots = 16
         num_patterns = 16
         num_heads = 4
-        batch_size = 4
+        batch_size = 2  # Reduced for GPU memory
         max_passes = 6
         max_recurrent_steps = 4
     else:
@@ -316,6 +339,9 @@ def main():
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.1)
     
+    # Gradient accumulation - effective batch = batch_size * grad_accum_steps
+    grad_accum_steps = 2 if preset_name in ["full", "runpod"] else 1
+    
     log_dir = Path("logs") / f"dlsmn_{preset_name}_{time.strftime('%Y%m%d_%H%M%S')}"
     writer = SummaryWriter(log_dir)
     print(f"TensorBoard logs: {log_dir}")
@@ -326,7 +352,7 @@ def main():
     for epoch in range(50):
         train_loss, train_cell_acc, train_task_acc, global_step = train_epoch(
             model, train_loader, optimizer, device, config, global_step,
-            writer=writer, log_interval=10
+            writer=writer, log_interval=10, grad_accum_steps=grad_accum_steps
         )
         
         writer.add_scalar('Epoch/train_loss', train_loss, epoch)

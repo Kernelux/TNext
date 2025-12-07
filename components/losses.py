@@ -174,7 +174,13 @@ def compute_total_loss(
     Returns total_loss and a dictionary of scalar loss components for logging.
     """
     # 1. Task Loss
-    pass_logits_list = aux_info.get('pass_logits', [logits])
+    # Only use deep supervision if enabled (memory intensive)
+    features = config.features
+    if features.use_deep_supervision:
+        pass_logits_list = aux_info.get('pass_logits', [logits])
+    else:
+        pass_logits_list = [logits]  # Only final output
+        
     task_loss, color_loss, size_loss = compute_task_loss(
         logits, size_logits, test_output, output_size, pass_logits_list, model.num_colors
     )

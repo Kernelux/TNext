@@ -69,7 +69,7 @@ class FeatureFlags:
     use_soft_wta_update: bool = True     # Use exponential weighting for updates
     
     # === TRM INSIGHTS (ref/2510.04871v1.pdf) ===
-    use_deep_supervision: bool = True    # Train on every pass
+    use_deep_supervision: bool = False   # Train on every pass (memory intensive - disabled by default)
     use_explicit_q_head: bool = True     # Train halt_net as Q-Head (correctness predictor)
     use_answer_feedback: bool = True     # Feed previous pass's answer back (TRM's key insight)
     
