@@ -447,14 +447,34 @@ class DLSMN_ARC(nn.Module):
                         aux_data['write_gates'].append(updates['write_gate'].detach())
             
             # Collect expected steps for this pass
+            # MEMORY OPTIMIZATION: Detach expected_steps from earlier passes
+            # The efficiency loss only needs gradients from the current pass
+            # We keep the values for computing the loss, but break the graph
             if 'expected_steps' not in aux_data: aux_data['expected_steps'] = []
-            aux_data['expected_steps'].append(torch.stack(pass_expected_steps, dim=1))  # [B, num_layers]
+            current_expected_steps = torch.stack(pass_expected_steps, dim=1)  # [B, num_layers]
+            
+            # Detach all previous expected_steps to free memory
+            # Only the last pass (or current accumulation) needs gradients
+            if pass_num < num_passes:
+                aux_data['expected_steps'].append(current_expected_steps.detach())
+            else:
+                # Last pass - keep gradients for backprop
+                aux_data['expected_steps'].append(current_expected_steps)
             
             if pass_num < num_passes and features.use_cache_self_attn:
                 cache = self.cache_self_attn(cache)
+                # MEMORY OPTIMIZATION: Detach cache after self-attention between passes
+                # This breaks the gradient chain but dramatically reduces memory
+                if features.detach_cache_between_passes:
+                    cache = cache.detach()
             
             halt_prob = self.compute_halt_prob(cache)
-            aux_data['halt_probs'].append(halt_prob)
+            # MEMORY OPTIMIZATION: Only keep gradients for the last pass's halt_prob
+            # Q-head loss only uses the final halt_prob anyway
+            if pass_num < num_passes:
+                aux_data['halt_probs'].append(halt_prob.detach())
+            else:
+                aux_data['halt_probs'].append(halt_prob)
             
             test_h = h[:, test_start_idx:]
             pass_logits = self.output_proj(test_h).view(B, H, W, -1)

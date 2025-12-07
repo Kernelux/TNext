@@ -52,6 +52,9 @@ class FeatureFlags:
     use_layer_act: bool = True          # False = fixed recurrent steps (layer-level)
     use_gated_fusion: bool = True       # False = additive fusion
     use_moe_memory: bool = True         # MoE-style memory routing (should I read? should I write?)
+    
+    # Memory optimization
+    detach_cache_between_passes: bool = True  # Detach cache between passes to reduce memory
 
     # Pattern pooling
     use_pattern_pooling: bool = True    # False = direct token caching
