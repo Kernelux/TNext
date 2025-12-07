@@ -90,7 +90,7 @@ class DLSMN_ARC(nn.Module):
         # Model-level halt network (on cache state) - Q-head for pass halting
         self.halt_net = nn.Sequential(
             nn.Linear(d_cache, d_cache // 2),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(d_cache // 2, 1),
             nn.Sigmoid(),
         )
@@ -104,7 +104,7 @@ class DLSMN_ARC(nn.Module):
         # Predictor: h_pooled + layer_ctx + pass_ctx -> step distribution
         self.step_predictor = nn.Sequential(
             nn.Linear(d_model + d_model // 4 + d_model // 4, d_model // 2),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(d_model // 2, self.max_recurrent_steps),
             # No softmax - applied with temperature in forward
         )
@@ -112,7 +112,7 @@ class DLSMN_ARC(nn.Module):
         # Predictive head for auxiliary loss (Section 9.1)
         self.predictor = nn.Sequential(
             nn.Linear(d_cache, d_cache),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(d_cache, d_model),
         )
         
@@ -128,7 +128,7 @@ class DLSMN_ARC(nn.Module):
         # Size prediction head
         self.size_proj = nn.Sequential(
             nn.Linear(d_model, 64),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(64, max_grid_size * 2),
         )
     

@@ -134,7 +134,7 @@ class MemoryRouter(nn.Module):
         # 1. Should I read from cache?
         self.read_gate = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(d_model // 2, 1),
             nn.Sigmoid(),
         )
@@ -146,7 +146,7 @@ class MemoryRouter(nn.Module):
         # 3. Should I write to cache? (coarse filter)
         self.write_gate = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(d_model // 2, 1),
             nn.Sigmoid(),
         )
@@ -154,7 +154,7 @@ class MemoryRouter(nn.Module):
         # 4. What to write? (importance/priority score)
         self.write_importance = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(d_model // 2, 1),
             nn.Sigmoid(),
         )
