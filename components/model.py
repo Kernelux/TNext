@@ -246,7 +246,9 @@ class DLSMN_ARC(nn.Module):
         
         # [REFINEMENT: use_soft_wta_update]
         if features.use_soft_wta_update:
-            weights = torch.exp(scores).unsqueeze(-1) * write_mask
+            # Clamp scores to prevent exp overflow (exp(88) ≈ 1e38, close to float32 max)
+            clamped_scores = scores.clamp(min=-50, max=50)
+            weights = torch.exp(clamped_scores).unsqueeze(-1) * write_mask
         else:
             weights = scores.unsqueeze(-1) * write_mask
             
