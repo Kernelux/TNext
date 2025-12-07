@@ -119,49 +119,47 @@ def compute_step_efficiency_loss(
     device: torch.device
 ) -> torch.Tensor:
     """
-    [LAYER STEP EFFICIENCY]
-    Minimize steps when correct, maximize steps when wrong (to encourage finding solution).
+    [LAYER STEP EFFICIENCY - Option D: Correct-Conditioned]
+    
+    Only optimize for efficiency when the task is correct.
+    This avoids the adversarial min/max dynamic:
+    - When correct: minimize steps (be efficient)
+    - When wrong: no step loss (let task_loss drive learning)
+    
+    This creates a stable equilibrium where the model first learns
+    to solve tasks, then optimizes for efficiency.
     """
     step_efficiency_loss = torch.tensor(0.0, device=device)
     features = config.features
 
     if features.use_layer_act and 'expected_steps' in aux_info and aux_info['expected_steps']:
-        # Compute is_correct from final logits - task-level accuracy (ALL cells must be correct)
+        # Task-level correctness: ALL cells must be correct
         final_preds = logits.detach().argmax(dim=-1)
-        # Calculate task correctness (all cells in the task must be correct)
         is_correct = (final_preds == test_output).all(dim=-1).all(dim=-1).float()  # [B]
+        
+        # Skip if nothing is correct (no efficiency signal to give)
+        if is_correct.sum() == 0:
+            return step_efficiency_loss
 
-        # Calculate per-token correctness for more granular feedback
-        token_correct = (final_preds == test_output).float()  # [B, H, W]
-
-        total_expected_steps = 0.0
-        count = 0
-
-        for es in aux_info['expected_steps']:  # es shape: [B, num_layers]
-            # Calculate expected steps per batch item and layer
-            # es: [B, num_layers] where each element is sum of steps across recurrent steps for that layer
-            expected_sum = es.sum(dim=1)  # [B] - total expected steps per batch item for this pass
-            total_expected_steps += expected_sum
-            count += 1
-
-        if count > 0:
-            avg_expected_steps = total_expected_steps / count  # [B]
-
-            # Calculate max possible steps for normalization
-            max_recurrent_steps = getattr(config, 'max_recurrent_steps', 4)
-            max_total_steps = float(max_recurrent_steps * model_num_layers)
-
-            # Normalize expected steps to [0,1] range
-            normalized_expected = avg_expected_steps / max_total_steps  # [B]
-
-            # Loss: For correct tasks -> minimize steps (reduce to 0)
-            #       For incorrect tasks -> maximize steps (move toward max_total_steps)
-            # This means: loss = is_correct * normalized_expected + (1 - is_correct) * (1 - normalized_expected)
-            step_efficiency_loss = (is_correct * normalized_expected +
-                                  (1 - is_correct) * (1 - normalized_expected)).mean()
-
-            # Final safety clamp
-            step_efficiency_loss = step_efficiency_loss.clamp(min=0.0, max=2.0)
+        # Collect expected steps across all passes
+        total_expected_steps = torch.zeros_like(is_correct)  # [B]
+        num_passes = len(aux_info['expected_steps'])
+        
+        for es in aux_info['expected_steps']:  # es: [B, num_layers]
+            total_expected_steps += es.sum(dim=1)  # Sum across layers
+        
+        # Normalize by max possible steps
+        max_recurrent_steps = getattr(config, 'max_recurrent_steps', 4)
+        max_total_steps = float(max_recurrent_steps * model_num_layers * num_passes)
+        normalized_steps = total_expected_steps / (max_total_steps + 1e-8)  # [B] in [0, 1]
+        
+        # OPTION D: Only penalize steps when correct
+        # When correct: loss = normalized_steps (minimize)
+        # When wrong: loss = 0 (no step penalty, focus on task_loss)
+        step_efficiency_loss = (is_correct * normalized_steps).sum() / (is_correct.sum() + 1e-8)
+        
+        # Clamp for safety
+        step_efficiency_loss = step_efficiency_loss.clamp(min=0.0, max=1.0)
 
     return step_efficiency_loss
 
