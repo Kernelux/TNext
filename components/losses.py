@@ -32,14 +32,16 @@ def compute_task_loss(
     test_output: torch.Tensor,
     output_size: torch.Tensor,
     pass_logits_list: List[torch.Tensor],
-    model_num_colors: int
+    model_num_colors: int,
+    max_grid_size: int = 30,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute core task losses: Color CrossEntropy and Size Error.
     Supports deep supervision via pass_logits_list.
     """
     total_color_loss = 0.0
-    targets = test_output.view(-1)
+    # Clamp targets to valid range [0, num_colors-1], use -1 for ignore
+    targets = test_output.view(-1).clamp(min=0, max=model_num_colors - 1)
     
     # If using deep supervision, average loss across all passes
     # defaulting to just using final logits if pass_logits_list is empty/single
@@ -51,8 +53,9 @@ def compute_task_loss(
         
     color_loss = total_color_loss / len(logits_to_process)
     
-    true_h = output_size[:, 0]
-    true_w = output_size[:, 1]
+    # Clamp size targets to valid range [0, max_grid_size-1]
+    true_h = output_size[:, 0].clamp(min=0, max=max_grid_size - 1)
+    true_w = output_size[:, 1].clamp(min=0, max=max_grid_size - 1)
     
     size_h = F.cross_entropy(size_logits[:, 0], true_h)
     size_w = F.cross_entropy(size_logits[:, 1], true_w)
@@ -182,7 +185,8 @@ def compute_total_loss(
         pass_logits_list = [logits]  # Only final output
         
     task_loss, color_loss, size_loss = compute_task_loss(
-        logits, size_logits, test_output, output_size, pass_logits_list, model.num_colors
+        logits, size_logits, test_output, output_size, pass_logits_list, 
+        model.num_colors, model.max_grid_size
     )
     
     # 2. Q-Head Loss
