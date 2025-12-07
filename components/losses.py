@@ -7,22 +7,22 @@ def compute_diversity_loss(slot_counts_list: list) -> torch.Tensor:
     """
     Slot Diversity Loss (Section 9.3 - Solution A):
     L_diversity = -λ_D · H(1/T · Σ_t slot_probs_t)
-    
+
     Encourages uniform slot usage across the sequence.
     """
     if not slot_counts_list:
         return torch.tensor(0.0)
-    
+
     # Aggregate slot counts across all layers
     total_counts = torch.stack(slot_counts_list).sum(dim=0)  # [B, K]
-    
+
     # Normalize to distribution
     total_counts = total_counts + 1e-8
     probs = total_counts / total_counts.sum(dim=-1, keepdim=True)
-    
+
     # Entropy (higher = more uniform = better)
     entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
-    
+
     # We want to maximize entropy, so return negative
     return -entropy
 
@@ -42,25 +42,25 @@ def compute_task_loss(
     total_color_loss = 0.0
     # Clamp targets to valid range [0, num_colors-1], use -1 for ignore
     targets = test_output.view(-1).clamp(min=0, max=model_num_colors - 1)
-    
+
     # If using deep supervision, average loss across all passes
     # defaulting to just using final logits if pass_logits_list is empty/single
     logits_to_process = pass_logits_list if pass_logits_list else [logits]
-    
+
     for p_logits in logits_to_process:
         p_logits_flat = p_logits.reshape(-1, model_num_colors)
         total_color_loss += F.cross_entropy(p_logits_flat, targets, ignore_index=-1)
-        
+
     color_loss = total_color_loss / len(logits_to_process)
-    
+
     # Clamp size targets to valid range [0, max_grid_size-1]
     true_h = output_size[:, 0].clamp(min=0, max=max_grid_size - 1)
     true_w = output_size[:, 1].clamp(min=0, max=max_grid_size - 1)
-    
+
     size_h = F.cross_entropy(size_logits[:, 0], true_h)
     size_w = F.cross_entropy(size_logits[:, 1], true_w)
     size_loss = size_h + size_w
-    
+
     total_task_loss = color_loss + size_loss
     return total_task_loss, color_loss, size_loss
 
@@ -77,10 +77,10 @@ def compute_q_head_loss(
     """
     model_q_loss = torch.tensor(0.0, device=device)
     features = config.features
-    
+
     if features.use_explicit_q_head and 'halt_probs' in aux_info and aux_info['halt_probs']:
         halt_probs = aux_info['halt_probs']
-        
+
         # Use final pass's halt_prob and compare against final correctness
         # This avoids needing pass_logits_list (which is empty when deep supervision is off)
         if halt_probs:
@@ -88,7 +88,7 @@ def compute_q_head_loss(
             final_halt = halt_probs[-1]
             # Clamp for numerical stability in BCE
             final_halt = final_halt.clamp(min=1e-6, max=1 - 1e-6)
-            
+
             # Use the test_output directly to check final prediction would be correct
             # (We don't have access to final logits here, so we use a simpler approach:
             #  train halt_prob toward 0.5 initially, let it learn from gradient signal)
@@ -107,7 +107,7 @@ def compute_q_head_loss(
                     target = torch.full_like(p_halt_clamped, 0.5)
                     model_q_loss += F.binary_cross_entropy(p_halt_clamped, target)
                 model_q_loss = model_q_loss / len(halt_probs)
-            
+
     return model_q_loss
 
 def compute_step_efficiency_loss(
@@ -124,41 +124,45 @@ def compute_step_efficiency_loss(
     """
     step_efficiency_loss = torch.tensor(0.0, device=device)
     features = config.features
-    
+
     if features.use_layer_act and 'expected_steps' in aux_info and aux_info['expected_steps']:
-        # Compute is_correct from final logits
+        # Compute is_correct from final logits - task-level accuracy (ALL cells must be correct)
         final_preds = logits.detach().argmax(dim=-1)
+        # Calculate task correctness (all cells in the task must be correct)
         is_correct = (final_preds == test_output).all(dim=-1).all(dim=-1).float()  # [B]
-        
-        # Stack all expected steps with numerical stability
-        expected_list = []
-        for es in aux_info['expected_steps']:
-            # Clamp to valid range to prevent NaN
-            es_clamped = es.sum(dim=-1).clamp(min=1e-6, max=1e6)
-            expected_list.append(es_clamped)
-        
-        if not expected_list:
-            return step_efficiency_loss
-            
-        all_expected = torch.cat(expected_list, dim=0)  # [num_passes * B]
-        is_correct_expanded = is_correct.repeat(len(aux_info['expected_steps']))  # [num_passes * B]
-        
-        max_recurrent_steps = getattr(config, 'max_recurrent_steps', 4)
-        max_total_steps = float(max_recurrent_steps * model_num_layers)
-        
-        # Loss: correct → minimize steps, wrong → maximize steps (search harder)
-        # Clamp the loss components to prevent extreme values
-        minimize_term = (is_correct_expanded * all_expected).clamp(max=max_total_steps)
-        maximize_term = ((1 - is_correct_expanded) * (max_total_steps - all_expected)).clamp(min=0, max=max_total_steps)
-        
-        step_efficiency_loss = (minimize_term + maximize_term).mean()
-        
-        # Normalize by max possible (with epsilon for safety)
-        step_efficiency_loss = step_efficiency_loss / (max_total_steps + 1e-8)
-        
-        # Final safety clamp
-        step_efficiency_loss = step_efficiency_loss.clamp(min=0, max=10.0)
-        
+
+        # Calculate per-token correctness for more granular feedback
+        token_correct = (final_preds == test_output).float()  # [B, H, W]
+
+        total_expected_steps = 0.0
+        count = 0
+
+        for es in aux_info['expected_steps']:  # es shape: [B, num_layers]
+            # Calculate expected steps per batch item and layer
+            # es: [B, num_layers] where each element is sum of steps across recurrent steps for that layer
+            expected_sum = es.sum(dim=1)  # [B] - total expected steps per batch item for this pass
+            total_expected_steps += expected_sum
+            count += 1
+
+        if count > 0:
+            avg_expected_steps = total_expected_steps / count  # [B]
+
+            # Calculate max possible steps for normalization
+            max_recurrent_steps = getattr(config, 'max_recurrent_steps', 4)
+            max_total_steps = float(max_recurrent_steps * model_num_layers)
+
+            # Normalize expected steps to [0,1] range
+            normalized_expected = avg_expected_steps / max_total_steps  # [B]
+
+            # Loss: For correct tasks -> minimize steps (reduce to 0)
+            #       For incorrect tasks -> maximize steps (move toward max_total_steps)
+            # This means: loss = is_correct * normalized_expected + (1 - is_correct) * (1 - normalized_expected)
+            step_efficiency_loss = (is_correct * normalized_expected +
+                                  (1 - is_correct) * (1 - normalized_expected)).mean()
+
+            # Final safety clamp
+            step_efficiency_loss = step_efficiency_loss.clamp(min=0.0, max=2.0)
+
     return step_efficiency_loss
 
 def compute_ponder_loss(aux_info: Dict, config: TrainingConfig, device: torch.device) -> torch.Tensor:
@@ -168,10 +172,10 @@ def compute_ponder_loss(aux_info: Dict, config: TrainingConfig, device: torch.de
     """
     features = config.features
     model_ponder_loss = torch.tensor(0.0, device=device)
-    
+
     if features.use_ponder_loss and features.use_act_halting and 'ponder_cost' in aux_info:
         model_ponder_loss = aux_info['ponder_cost']
-        
+
     return model_ponder_loss
 
 def compute_total_loss(
@@ -196,45 +200,45 @@ def compute_total_loss(
         pass_logits_list = aux_info.get('pass_logits', [logits])
     else:
         pass_logits_list = [logits]  # Only final output
-        
+
     task_loss, color_loss, size_loss = compute_task_loss(
-        logits, size_logits, test_output, output_size, pass_logits_list, 
+        logits, size_logits, test_output, output_size, pass_logits_list,
         model.num_colors, model.max_grid_size
     )
-    
+
     # 2. Q-Head Loss
     model_q_loss = compute_q_head_loss(aux_info, test_output, config, device)
-    
+
     # 3. Step Efficiency Loss
     step_efficiency_loss = compute_step_efficiency_loss(
         logits, aux_info, test_output, config, model.num_layers, device
     )
-    
+
     # 4. Diversity Loss (always active, prevents slot collapse)
     diversity_loss = torch.tensor(0.0, device=device)
     features = config.features
     if features.use_diversity_loss and 'slot_counts' in aux_info and aux_info['slot_counts']:
         diversity_loss = compute_diversity_loss(aux_info['slot_counts'])
-    
+
     # 5. Ponder Loss
     model_ponder_loss = compute_ponder_loss(aux_info, config, device)
-    
+
     # Weighted Sum with NaN protection
     compute_loss = (
         config.lambda_q_head * model_q_loss +
         config.lambda_ponder * model_ponder_loss +
         config.lambda_step_efficiency * step_efficiency_loss
     )
-    
+
     total_loss = task_loss + compute_loss + config.lambda_diversity * diversity_loss
-    
+
     # NaN protection: if any component is NaN, use only task_loss
     if torch.isnan(total_loss):
         print(f"WARNING: NaN detected! task={task_loss.item():.4f}, q_head={model_q_loss.item():.4f}, "
               f"ponder={model_ponder_loss.item():.4f}, step_eff={step_efficiency_loss.item():.4f}, "
               f"diversity={diversity_loss.item():.4f}")
         total_loss = task_loss  # Fallback to just task loss
-    
+
     # Return metrics for logging
     metrics = {
         'loss_total': total_loss.detach().item(),
@@ -247,5 +251,5 @@ def compute_total_loss(
         'loss_ponder': model_ponder_loss.detach().item() if isinstance(model_ponder_loss, torch.Tensor) else model_ponder_loss,
         'loss_step_efficiency': step_efficiency_loss.detach().item() if isinstance(step_efficiency_loss, torch.Tensor) else step_efficiency_loss,
     }
-    
+
     return total_loss, metrics
