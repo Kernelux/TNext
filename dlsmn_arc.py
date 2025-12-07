@@ -283,7 +283,7 @@ def main():
         num_layers = 4     # Reduced from 3
         num_slots = 16     # Reduced from 12
         num_patterns = 12  # Reduced from 12
-        num_heads = 2
+        num_heads = 1
         batch_size = 8     # Conservative for memory
         max_passes = 4     # Reduced from 4
         max_recurrent_steps = 4

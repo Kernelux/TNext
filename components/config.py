@@ -55,6 +55,7 @@ class FeatureFlags:
     
     # Memory optimization
     detach_cache_between_passes: bool = True  # Detach cache between passes to reduce memory
+    use_linear_attention: bool = True   # Use O(S) linear attention instead of O(S²) softmax attention
 
     # Pattern pooling
     use_pattern_pooling: bool = True    # False = direct token caching

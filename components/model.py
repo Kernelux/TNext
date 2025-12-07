@@ -83,7 +83,8 @@ class DLSMN_ARC(nn.Module):
         ])
         
         # Cache-to-cache attention (Section 10.2)
-        self.cache_self_attn = CacheSelfAttention(d_cache, num_heads, dropout)
+        # Using LinearAttention by default for O(S) memory efficiency
+        self.cache_self_attn = CacheSelfAttention(d_cache, num_heads, dropout, use_linear=True)
         
         # === HIERARCHICAL ACT ===
         # Model-level halt network (on cache state) - Q-head for pass halting

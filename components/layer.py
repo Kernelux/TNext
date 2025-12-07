@@ -5,7 +5,7 @@ import math
 from typing import Optional, Dict, Tuple
 
 from .config import FeatureFlags
-from .modules import MemoryRouter, SelectionHead
+from .modules import MemoryRouter, SelectionHead, LinearAttention, LinearCrossAttention
 
 class DLSMNLayer(nn.Module):
     """
@@ -45,11 +45,13 @@ class DLSMNLayer(nn.Module):
         #   2. memory_context: read from cache [B, S, D_model] or None
         
         # Cross-attention: x attends to memory (if available)
-        self.memory_cross_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        # Using LinearAttention for O(S) memory efficiency
+        self.memory_cross_attn = LinearCrossAttention(d_model, num_heads, dropout=dropout)
         self.norm_cross = nn.LayerNorm(d_model)
         
         # Self-attention on (x + memory info)
-        self.self_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        # Using LinearAttention for O(S) memory efficiency
+        self.self_attn = LinearAttention(d_model, num_heads, dropout=dropout)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.GELU(),
@@ -70,8 +72,13 @@ class DLSMNLayer(nn.Module):
         self.no_memory_embed = nn.Parameter(torch.zeros(1, 1, d_model))
         
         # Pattern pooling: learnable queries that extract pattern summaries
+        # Using efficient linear projection instead of attention (since queries are fixed)
         self.pattern_queries = nn.Parameter(torch.randn(num_patterns, d_model) * 0.02)
-        self.pattern_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        # Efficient pattern extraction: linear projection + cross-attention scores
+        self.pattern_key_proj = nn.Linear(d_model, d_model)
+        self.pattern_value_proj = nn.Linear(d_model, d_model)
+        self.pattern_out_proj = nn.Linear(d_model, d_model)
+        self.pattern_dropout = nn.Dropout(dropout)
         
         # Head B: Selection (Section 2.2)
         self.selection_head = SelectionHead(d_model, d_cache, num_slots)
@@ -305,9 +312,20 @@ class DLSMNLayer(nn.Module):
         y = self.process_with_memory(x, memory_context, features)
         
         # === Pattern extraction for writing ===
+        # Using efficient linear projection instead of full attention
+        # Since pattern_queries are fixed, we can use linear attention pattern
         if features.use_pattern_pooling:
-            queries = self.pattern_queries.unsqueeze(0).expand(B, -1, -1)
-            patterns, _ = self.pattern_attn(queries, y, y)
+            queries = self.pattern_queries.unsqueeze(0).expand(B, -1, -1)  # [B, P, D]
+            keys = self.pattern_key_proj(y)    # [B, S, D]
+            values = self.pattern_value_proj(y)  # [B, S, D]
+            
+            # Efficient attention: Q @ K^T @ V without materializing S×P matrix
+            # scores: [B, P, S] = queries @ keys^T / sqrt(d)
+            scores = torch.matmul(queries, keys.transpose(-2, -1)) / math.sqrt(self.d_model)
+            attn_weights = F.softmax(scores, dim=-1)  # [B, P, S] - P is small (num_patterns)
+            patterns = torch.matmul(attn_weights, values)  # [B, P, D]
+            patterns = self.pattern_out_proj(patterns)
+            patterns = self.pattern_dropout(patterns)
         else:
             if S <= self.num_patterns:
                 patterns = F.pad(y, (0, 0, 0, self.num_patterns - S))

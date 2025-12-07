@@ -7,6 +7,97 @@ from typing import Optional, Dict
 from .utils import gumbel_softmax
 from .config import FeatureFlags
 
+
+# ============================================================================
+# Memory-Efficient Attention Alternatives
+# ============================================================================
+
+def elu_feature_map(x: torch.Tensor) -> torch.Tensor:
+    """ELU+1 feature map for linear attention."""
+    return F.elu(x) + 1
+
+
+class LinearAttention(nn.Module):
+    """
+    Linear Attention: O(S) time and memory instead of O(S²).
+    
+    Instead of: softmax(QK^T / √d) @ V  [O(S²)]
+    Uses:       φ(Q) @ (φ(K)^T @ V)     [O(S·d)]
+    
+    Where φ is ELU+1 feature map.
+    This avoids materializing the S×S attention matrix.
+    """
+    
+    def __init__(self, d_model: int, num_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.dropout = nn.Dropout(dropout)
+        
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        
+    def forward(
+        self, 
+        query: torch.Tensor,  # [B, S_q, D]
+        key: torch.Tensor,    # [B, S_k, D]
+        value: torch.Tensor,  # [B, S_k, D]
+        need_weights: bool = False,
+    ) -> tuple:
+        B, S_q, _ = query.shape
+        _, S_k, _ = key.shape
+        
+        # Project and reshape to heads
+        Q = self.q_proj(query).view(B, S_q, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.k_proj(key).view(B, S_k, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.v_proj(value).view(B, S_k, self.num_heads, self.head_dim).transpose(1, 2)
+        # Q, K, V: [B, H, S, head_dim]
+        
+        # Apply feature map (ELU+1)
+        Q = elu_feature_map(Q)
+        K = elu_feature_map(K)
+        
+        # Linear attention: φ(Q) @ (φ(K)^T @ V)
+        # First compute K^T @ V: [B, H, head_dim, head_dim]
+        KV = torch.einsum('bhsd,bhse->bhde', K, V)
+        
+        # Then Q @ KV: [B, H, S_q, head_dim]
+        out = torch.einsum('bhqd,bhde->bhqe', Q, KV)
+        
+        # Normalize by sum of keys (for numerical stability)
+        K_sum = K.sum(dim=2, keepdim=True)  # [B, H, 1, head_dim]
+        normalizer = torch.einsum('bhqd,bhkd->bhq', Q, K_sum) + 1e-6  # [B, H, S_q]
+        out = out / normalizer.unsqueeze(-1)
+        
+        # Reshape back
+        out = out.transpose(1, 2).contiguous().view(B, S_q, self.d_model)
+        out = self.out_proj(out)
+        out = self.dropout(out)
+        
+        return out, None  # No attention weights in linear attention
+
+
+class LinearCrossAttention(nn.Module):
+    """
+    Linear Cross-Attention for memory reading.
+    Same O(S) complexity, but Q and K/V come from different sources.
+    """
+    
+    def __init__(self, d_model: int, num_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.attn = LinearAttention(d_model, num_heads, dropout)
+        
+    def forward(
+        self,
+        query: torch.Tensor,   # [B, S_q, D] - queries from input
+        memory: torch.Tensor,  # [B, S_m, D] - keys/values from memory
+        need_weights: bool = False,
+    ) -> tuple:
+        return self.attn(query, memory, memory, need_weights)
+
 class MemoryRouter(nn.Module):
     """
     MoE-style Memory Router for sequential read/write operations.
@@ -275,11 +366,17 @@ class CacheSelfAttention(nn.Module):
     
     Enables symbolic reasoning, graph propagation, and iterative
     refinement without expensive full forward passes.
+    
+    Uses LinearAttention by default for O(S) memory efficiency.
     """
     
-    def __init__(self, d_cache: int, num_heads: int = 4, dropout: float = 0.1):
+    def __init__(self, d_cache: int, num_heads: int = 4, dropout: float = 0.1, use_linear: bool = True):
         super().__init__()
-        self.attn = nn.MultiheadAttention(d_cache, num_heads, dropout=dropout, batch_first=True)
+        self.use_linear = use_linear
+        if use_linear:
+            self.attn = LinearAttention(d_cache, num_heads, dropout)
+        else:
+            self.attn = nn.MultiheadAttention(d_cache, num_heads, dropout=dropout, batch_first=True)
         self.norm = nn.LayerNorm(d_cache)
         
     def forward(self, cache: torch.Tensor) -> torch.Tensor:
@@ -289,5 +386,8 @@ class CacheSelfAttention(nn.Module):
         Returns:
             Updated cache with inter-slot reasoning
         """
-        attn_out, _ = self.attn(cache, cache, cache)
+        if self.use_linear:
+            attn_out, _ = self.attn(cache, cache, cache)
+        else:
+            attn_out, _ = self.attn(cache, cache, cache)
         return self.norm(cache + attn_out)
