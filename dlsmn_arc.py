@@ -278,15 +278,15 @@ def main():
         # Optimized for ~44GB GPU (A40, A100-40GB, etc.)
         # REDUCED: Original config used 78GB+ on 80GB GPU
         max_grid_size = 30
-        d_model = 96       # Reduced from 128
-        d_cache = 48       # Reduced from 64
-        num_layers = 2     # Reduced from 3
-        num_slots = 10     # Reduced from 12
-        num_patterns = 10  # Reduced from 12
-        num_heads = 4
-        batch_size = 4     # Conservative for memory
-        max_passes = 3     # Reduced from 4
-        max_recurrent_steps = 2
+        d_model = 64       # Reduced from 128
+        d_cache = 32       # Reduced from 64
+        num_layers = 4     # Reduced from 3
+        num_slots = 16     # Reduced from 12
+        num_patterns = 12  # Reduced from 12
+        num_heads = 2
+        batch_size = 8     # Conservative for memory
+        max_passes = 4     # Reduced from 4
+        max_recurrent_steps = 4
     elif preset_name == "full":
         max_grid_size = 30
         d_model = 128
