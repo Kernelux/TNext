@@ -205,11 +205,18 @@ class DLSMN_ARC(nn.Module):
         - Pass 2+: Layer j reads C[:] (full cache)
         
         Returns mask where True = BLOCKED.
+        
+        Note: For layer 0 pass 1, no earlier layers exist, so we allow 
+        reading its own slots (otherwise everything is masked -> NaN).
         """
         mask = torch.zeros(batch_size, self.total_slots, dtype=torch.bool, device=device)
         if pass_num == 1:
             first_blocked_slot = layer_idx * self.num_slots
-            mask[:, first_blocked_slot:] = True
+            # Special case: layer 0 can read its own slots (initialized from slot_embeddings)
+            if first_blocked_slot > 0:
+                mask[:, first_blocked_slot:] = True
+            # For layer 0, first_blocked_slot=0, so nothing is masked - this is intentional
+            # The initialized slot_embeddings serve as the initial "memory" to read from
         return mask
     
     def apply_cache_updates(

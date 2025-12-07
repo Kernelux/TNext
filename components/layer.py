@@ -152,7 +152,15 @@ class DLSMNLayer(nn.Module):
         if features.use_write_count_masking and write_counts is not None:
             # Mask where write_count == 0
             unwritten = (write_counts == 0).unsqueeze(1).expand(-1, S, -1)
-            scores = scores.masked_fill(unwritten, float('-inf'))
+            # IMPORTANT: Don't mask if ALL slots are unwritten (early training)
+            # Check per-batch if any slot has been written to
+            any_written = (write_counts > 0).any(dim=-1, keepdim=True).unsqueeze(1)  # [B, 1, 1]
+            # Only apply mask if at least one slot is written
+            scores = torch.where(
+                any_written.expand_as(scores),
+                scores.masked_fill(unwritten, float('-inf')),
+                scores  # Keep original scores if nothing written yet
+            )
         
         # [MoE MEMORY: Apply learned slot selection]
         # read_slot_probs from MemoryRouter tells us which slots each token prefers
