@@ -73,27 +73,40 @@ def compute_q_head_loss(
     """
     [TRM INSIGHT: Explicit Q-Head Loss]
     Trains the halt_net to predict correctness of the current state.
+    Uses final logits only (not per-pass) for efficiency.
     """
     model_q_loss = torch.tensor(0.0, device=device)
     features = config.features
     
     if features.use_explicit_q_head and 'halt_probs' in aux_info and aux_info['halt_probs']:
         halt_probs = aux_info['halt_probs']
-        pass_logits_list = aux_info.get('pass_logits', [])
         
-        num_passes_with_probs = min(len(halt_probs), len(pass_logits_list))
-        
-        for i in range(num_passes_with_probs):
-            p_logits = pass_logits_list[i]
-            preds = p_logits.detach().argmax(dim=-1)
-            # Correct if all cells match target
-            is_correct = (preds == test_output).all(dim=-1).all(dim=-1).float()
-            p_halt = halt_probs[i]
-            # BCE: predicted halt prob should match is_correct (1.0 or 0.0)
-            model_q_loss += F.binary_cross_entropy(p_halt, is_correct.detach())
-        
-        if num_passes_with_probs > 0:
-            model_q_loss = model_q_loss / num_passes_with_probs
+        # Use final pass's halt_prob and compare against final correctness
+        # This avoids needing pass_logits_list (which is empty when deep supervision is off)
+        if halt_probs:
+            # Get final halt prob
+            final_halt = halt_probs[-1]
+            # Clamp for numerical stability in BCE
+            final_halt = final_halt.clamp(min=1e-6, max=1 - 1e-6)
+            
+            # Use the test_output directly to check final prediction would be correct
+            # (We don't have access to final logits here, so we use a simpler approach:
+            #  train halt_prob toward 0.5 initially, let it learn from gradient signal)
+            # Actually, we need the final logits. Let's check if they're in aux_info
+            if 'final_logits' in aux_info:
+                final_logits = aux_info['final_logits']
+                preds = final_logits.detach().argmax(dim=-1)
+                is_correct = (preds == test_output).all(dim=-1).all(dim=-1).float()
+                model_q_loss = F.binary_cross_entropy(final_halt, is_correct.detach())
+            else:
+                # Fallback: average over all halt probs with a uniform target
+                # This just regularizes halt_probs toward middle values
+                for p_halt in halt_probs:
+                    p_halt_clamped = p_halt.clamp(min=1e-6, max=1 - 1e-6)
+                    # Soft target: encourage exploration (0.5)
+                    target = torch.full_like(p_halt_clamped, 0.5)
+                    model_q_loss += F.binary_cross_entropy(p_halt_clamped, target)
+                model_q_loss = model_q_loss / len(halt_probs)
             
     return model_q_loss
 
@@ -206,7 +219,7 @@ def compute_total_loss(
     # 5. Ponder Loss
     model_ponder_loss = compute_ponder_loss(aux_info, config, device)
     
-    # Weighted Sum
+    # Weighted Sum with NaN protection
     compute_loss = (
         config.lambda_q_head * model_q_loss +
         config.lambda_ponder * model_ponder_loss +
@@ -214,6 +227,13 @@ def compute_total_loss(
     )
     
     total_loss = task_loss + compute_loss + config.lambda_diversity * diversity_loss
+    
+    # NaN protection: if any component is NaN, use only task_loss
+    if torch.isnan(total_loss):
+        print(f"WARNING: NaN detected! task={task_loss.item():.4f}, q_head={model_q_loss.item():.4f}, "
+              f"ponder={model_ponder_loss.item():.4f}, step_eff={step_efficiency_loss.item():.4f}, "
+              f"diversity={diversity_loss.item():.4f}")
+        total_loss = task_loss  # Fallback to just task loss
     
     # Return metrics for logging
     metrics = {

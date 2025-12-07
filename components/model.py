@@ -486,6 +486,8 @@ class DLSMN_ARC(nn.Module):
             'num_passes': pass_num,
             'pass_logits': aux_data.get('pass_logits', []),
             'halt_probs': aux_data['halt_probs'],
+            'final_logits': logits,  # For Q-head loss without deep supervision
+            'expected_steps': aux_data.get('expected_steps', []),  # For step efficiency loss
         }
         
         if 'layer_halt_probs' in aux_data: aux_info['layer_halt_probs'] = aux_data['layer_halt_probs']
