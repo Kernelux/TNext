@@ -278,8 +278,8 @@ def main():
         # Optimized for ~44GB GPU (A40, A100-40GB, etc.)
         # REDUCED: Original config used 78GB+ on 80GB GPU
         max_grid_size = 30
-        d_model = 64       # Reduced from 128
-        d_cache = 32       # Reduced from 64
+        d_model = 32       # Reduced from 128
+        d_cache = 16       # Reduced from 64
         num_layers = 4     # Reduced from 3
         num_slots = 16     # Reduced from 12
         num_patterns = 12  # Reduced from 12
