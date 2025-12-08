@@ -275,18 +275,18 @@ def main():
         max_passes = 4
         max_recurrent_steps = 2
     elif preset_name == "runpod":
-        # Optimized for ~44GB GPU (A40, A100-40GB, etc.)
-        # REDUCED: Original config used 78GB+ on 80GB GPU
+        # Optimized for ~44GB GPU with LinearAttention (O(S) memory)
+        # Increased capacity since we no longer have O(S²) attention memory
         max_grid_size = 30
-        d_model = 32       # Reduced from 128
-        d_cache = 16       # Reduced from 64
-        num_layers = 4     # Reduced from 3
-        num_slots = 16     # Reduced from 12
-        num_patterns = 12  # Reduced from 12
+        d_model = 128      # Restored - LinearAttention makes this feasible
+        d_cache = 64       # Restored
+        num_layers = 4
+        num_slots = 16
+        num_patterns = 16
         num_heads = 4
-        batch_size = 32     # Conservative for memory
-        max_passes = 4     # Reduced from 4
-        max_recurrent_steps = 4
+        batch_size = 16    # Can increase with linear attention
+        max_passes = 4
+        max_recurrent_steps = 3
     elif preset_name == "full":
         max_grid_size = 30
         d_model = 128
@@ -354,7 +354,9 @@ def main():
         dropout=0.1,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.1)
+    # Higher LR for runpod with cosine schedule
+    lr = 3e-4 if preset_name == "runpod" else 1e-4
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
     # Gradient accumulation - effective batch = batch_size * grad_accum_steps
     grad_accum_steps = 2 if preset_name in ["full", "runpod"] else 1
