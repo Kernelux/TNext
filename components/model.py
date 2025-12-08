@@ -51,7 +51,7 @@ class DLSMN_ARC(nn.Module):
         self.d_layer = d_cache // 4  # Layer-ID embedding dimension
         
         # Embeddings
-        self.color_embed = nn.Embedding(num_colors + 1, d_model)
+        self.color_embed = nn.Embedding(num_colors, d_model)  # 0-9 colors
         self.pos_embed_h = nn.Embedding(max_grid_size, d_model // 2)
         self.pos_embed_w = nn.Embedding(max_grid_size, d_model // 2)
         self.type_embed = nn.Embedding(4, d_model)
@@ -66,6 +66,17 @@ class DLSMN_ARC(nn.Module):
         self.layer_id_embeddings = nn.Parameter(
             torch.randn(num_layers, self.d_layer) * 0.02
         )
+        
+        # Temporal context embeddings for cache entries
+        # These encode WHEN information was written (pass + recurrent step)
+        # Dimension: D_cache // 8 each, so total temporal = D_cache // 4
+        self.d_temporal = d_cache // 8
+        self.pass_embeddings = nn.Embedding(max_passes + 1, self.d_temporal)  # +1 for pass 0/init
+        self.step_embeddings = nn.Embedding(max_recurrent_steps + 1, self.d_temporal)  # +1 for step 0
+        
+        # Projection to add temporal context to cache entries (additive, not concat)
+        # This keeps cache dimension fixed while encoding temporal info
+        self.temporal_proj = nn.Linear(self.d_temporal * 2, d_cache)
         
         # DLSMN layers with proper signatures
         self.layers = nn.ModuleList([
@@ -92,6 +103,22 @@ class DLSMN_ARC(nn.Module):
             nn.Linear(d_cache, d_cache // 2),
             nn.SiLU(),
             nn.Linear(d_cache // 2, 1),
+            nn.Sigmoid(),
+        )
+        
+        # [TRM] Dual Q-head: Q_halt + Q_continue (like TinyTRM)
+        # This allows learning "should stop" vs "should continue" separately
+        self.q_head = nn.Sequential(
+            nn.Linear(d_cache, d_cache // 2),
+            nn.SiLU(),
+            nn.Linear(d_cache // 2, 2),  # Output: [q_halt, q_continue]
+        )
+        
+        # [TRM] Refinement read: project cache to model space for answer refinement
+        self.refinement_query = nn.Linear(d_model, d_cache)
+        self.refinement_value = nn.Linear(d_cache, d_model)
+        self.refinement_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
             nn.Sigmoid(),
         )
         
@@ -226,12 +253,17 @@ class DLSMN_ARC(nn.Module):
         updates: Dict,
         layer_idx: int,
         threshold: float,
+        pass_num: int = 1,
+        recur_step: int = 0,
         features: Optional[FeatureFlags] = None,
     ) -> torch.Tensor:
         """
         Apply weighted cache writes (Section 3.1 Step 3, 7.3).
         
         Weighted mean aggregation with Soft WTA.
+        
+        Now includes temporal context: pass_num and recur_step are encoded
+        into the cache entries so readers can distinguish when info was written.
         """
         if features is None:
             features = FeatureFlags()
@@ -253,7 +285,22 @@ class DLSMN_ARC(nn.Module):
         else:
             weights = scores.unsqueeze(-1) * write_mask
             
-        weighted_y = weights * y_cache  # [B, num_patterns, D_cache]
+        # Add temporal context to cache entries
+        # This encodes WHEN this information was written (pass + step)
+        device = y_cache.device
+        pass_emb = self.pass_embeddings(
+            torch.tensor(min(pass_num, self.max_passes), device=device)
+        )  # [D_temporal]
+        step_emb = self.step_embeddings(
+            torch.tensor(min(recur_step, self.max_recurrent_steps), device=device)
+        )  # [D_temporal]
+        temporal_ctx = torch.cat([pass_emb, step_emb], dim=-1)  # [D_temporal * 2]
+        temporal_bias = self.temporal_proj(temporal_ctx)  # [D_cache]
+        
+        # Add temporal context to cache values (additive encoding)
+        y_cache_temporal = y_cache + temporal_bias.unsqueeze(0).unsqueeze(0)  # [B, P, D_cache]
+        
+        weighted_y = weights * y_cache_temporal  # [B, num_patterns, D_cache]
         
         # Aggregate to slots
         slot_writes = torch.einsum('bsk,bsd->bkd', slot_probs, weighted_y)
@@ -276,6 +323,51 @@ class DLSMN_ARC(nn.Module):
         )
         
         return new_cache
+    
+    def refinement_read(
+        self,
+        h: torch.Tensor,     # [B, S, D_model] - answer representation
+        cache: torch.Tensor, # [B, L*K, D_cache]
+    ) -> torch.Tensor:
+        """
+        [TRM] Refinement Read: Answer reads from cache before final output.
+        
+        This allows the answer to benefit from ALL patterns stored during
+        reasoning, not just what was explicitly passed through layers.
+        
+        Similar to TinyTRM's refinement step where z_H reads from slots
+        before being projected to output.
+        """
+        B, S, D = h.shape
+        
+        # Query the cache
+        q = self.refinement_query(h)  # [B, S, D_cache]
+        
+        # Attention over cache slots
+        scores = torch.matmul(q, cache.transpose(-2, -1)) / (self.d_cache ** 0.5)
+        attn = F.softmax(scores, dim=-1)  # [B, S, L*K]
+        
+        # Read values
+        context = torch.matmul(attn, self.refinement_value(cache))  # [B, S, D_model]
+        
+        # Gated fusion
+        gate = self.refinement_gate(torch.cat([h, context], dim=-1))
+        h_refined = gate * context + (1 - gate) * h
+        
+        return h_refined
+    
+    def compute_dual_q(self, cache: torch.Tensor) -> tuple:
+        """
+        [TRM] Compute Q_halt and Q_continue from cache state.
+        
+        Q_halt: should be high when prediction is correct (should stop)
+        Q_continue: should be high when prediction is wrong (should continue)
+        """
+        cache_pooled = cache.mean(dim=1)  # [B, D_cache]
+        q_logits = self.q_head(cache_pooled)  # [B, 2]
+        q_halt = q_logits[:, 0]  # [B]
+        q_continue = q_logits[:, 1]  # [B]
+        return q_halt, q_continue
     
     def compute_halt_prob(self, cache: torch.Tensor) -> torch.Tensor:
         """
@@ -339,6 +431,8 @@ class DLSMN_ARC(nn.Module):
             'entropy': [],
             'slot_counts': [],
             'halt_probs': [],
+            'q_halt': [],      # [TRM] Dual Q-head
+            'q_continue': [],  # [TRM] Dual Q-head
         }
         
         cumulative_halt = torch.zeros(B, device=device)
@@ -352,7 +446,11 @@ class DLSMN_ARC(nn.Module):
         pass_logits = None
         prev_answer = None
         
-        no_grad_passes = getattr(config, 'no_grad_passes', 0)
+        # [TRM] Gradient-free passes: run early passes without gradients
+        # This dramatically reduces memory and speeds up training
+        no_grad_passes = 0
+        if features.use_gradient_free_passes and self.training:
+            no_grad_passes = max(0, int(num_passes * features.gradient_free_ratio) - 1)
         
         for pass_num in range(1, num_passes + 1):
             is_no_grad_pass = (pass_num <= no_grad_passes) and self.training
@@ -423,7 +521,11 @@ class DLSMN_ARC(nn.Module):
                         
                         # Update cache after each step
                         if features.use_cache:
-                            cache = self.apply_cache_updates(cache, updates, layer_idx, threshold, features=features)
+                            cache = self.apply_cache_updates(
+                                cache, updates, layer_idx, threshold,
+                                pass_num=pass_num, recur_step=recur_step,
+                                features=features
+                            )
                             
                             start_idx = layer_idx * self.num_slots
                             end_idx = start_idx + self.num_slots
@@ -477,7 +579,21 @@ class DLSMN_ARC(nn.Module):
             else:
                 aux_data['halt_probs'].append(halt_prob)
             
+            # [TRM] Dual Q-head: compute Q_halt and Q_continue
+            if features.use_dual_q_head:
+                q_halt, q_continue = self.compute_dual_q(cache)
+                if pass_num < num_passes:
+                    aux_data['q_halt'].append(q_halt.detach())
+                    aux_data['q_continue'].append(q_continue.detach())
+                else:
+                    aux_data['q_halt'].append(q_halt)
+                    aux_data['q_continue'].append(q_continue)
+            
+            # [TRM] Refinement read: answer reads from cache before output
             test_h = h[:, test_start_idx:]
+            if features.use_refinement_read and pass_num == num_passes:
+                test_h = self.refinement_read(test_h, cache)
+            
             pass_logits = self.output_proj(test_h).view(B, H, W, -1)
             
             # Only store pass_logits if deep supervision enabled (memory optimization)
@@ -518,6 +634,9 @@ class DLSMN_ARC(nn.Module):
             'halt_probs': aux_data['halt_probs'],
             'final_logits': logits,  # For Q-head loss without deep supervision
             'expected_steps': aux_data.get('expected_steps', []),  # For step efficiency loss
+            # [TRM] Dual Q-head outputs
+            'q_halt': aux_data.get('q_halt', []),
+            'q_continue': aux_data.get('q_continue', []),
         }
         
         if 'layer_halt_probs' in aux_data: aux_info['layer_halt_probs'] = aux_data['layer_halt_probs']

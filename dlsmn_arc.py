@@ -146,6 +146,15 @@ def train_epoch(
             mode_map = {'force_max': 0, 'adaptive': 1, 'adaptive_penalized': 2}
             writer.add_scalar('Training/pass_mode', mode_map.get(pass_mode_val, 1), global_step)
 
+            # === TRM Q-Head Monitoring ===
+            # Log Q-head outputs if available (dual Q-head from TRM)
+            if 'q_halt' in aux_info and aux_info['q_halt']:
+                # Log final pass Q values (as probabilities for interpretability)
+                q_halt_final = torch.sigmoid(aux_info['q_halt'][-1].detach()).mean().item()
+                q_continue_final = torch.sigmoid(aux_info['q_continue'][-1].detach()).mean().item()
+                writer.add_scalar('TRM/q_halt_prob', q_halt_final, global_step)
+                writer.add_scalar('TRM/q_continue_prob', q_continue_final, global_step)
+
             # === Visualizations ===
             # Input (demo 0 input)
             inp_grid = demo_inputs[0, 0] # [H, W]
@@ -247,6 +256,46 @@ def evaluate(
     return cell_acc, task_acc
 
 
+def print_model_summary(model: torch.nn.Module):
+    print("\n" + "="*50)
+    print(f"Model Summary: {model.__class__.__name__}")
+    print("="*50)
+    
+    total_params = 0
+    trainable_params = 0
+    
+    # Track breakdown
+    breakdown = {
+        "Embeddings": 0,
+        "Layers": 0,
+        "Heads/Projections": 0,
+        "Other": 0
+    }
+    
+    for name, param in model.named_parameters():
+        num_params = param.numel()
+        total_params += num_params
+        if param.requires_grad:
+            trainable_params += num_params
+            
+        if any(x in name for x in ["embed", "embedding"]):
+            breakdown["Embeddings"] += num_params
+        elif "layers" in name:
+            breakdown["Layers"] += num_params
+        elif any(x in name for x in ["head", "proj", "net", "predictor", "gate"]):
+            breakdown["Heads/Projections"] += num_params
+        else:
+            breakdown["Other"] += num_params
+            
+    print(f"Total Parameters:     {total_params:,}")
+    print(f"Trainable Parameters: {trainable_params:,}")
+    print("-" * 50)
+    print("Breakdown:")
+    for category, count in breakdown.items():
+        percent = (count / total_params) * 100 if total_params > 0 else 0
+        print(f"  {category:<20}: {count:,} ({percent:.1f}%)")
+    print("="*50 + "\n")
+
 def main():
     # Check if data exists
     data_dir = Path("./ARC-AGI-2/data")
@@ -261,19 +310,20 @@ def main():
     preset_name = sys.argv[1] if len(sys.argv) > 1 else "fast"
     features = FEATURE_PRESETS.get(preset_name, FEATURE_PRESETS["fast"])
     print(f"\nUsing feature preset: '{preset_name}'")
+    print(f"Features: {features.describe()}")
 
     # Configure model params
     if preset_name == "fast_full":
-        max_grid_size = 15
+        max_grid_size = 30
         d_model = 64
         d_cache = 48
-        num_layers = 2
-        num_slots = 8
-        num_patterns = 8
+        num_layers = 4
+        num_slots = 32
+        num_patterns = 32
         num_heads = 2
         batch_size = 8
         max_passes = 4
-        max_recurrent_steps = 2
+        max_recurrent_steps = 4
     elif preset_name == "runpod":
         # Optimized for ~44GB GPU with LinearAttention (O(S) memory)
         # Increased capacity since we no longer have O(S²) attention memory
@@ -310,8 +360,10 @@ def main():
         max_passes = 2 if features.use_multi_pass else 1
         max_recurrent_steps = 1
 
-    train_dataset = ARCDataset(str(data_dir), split="training", max_grid_size=max_grid_size)
-    eval_dataset = ARCDataset(str(data_dir), split="evaluation", max_grid_size=max_grid_size)
+    # Training dataset WITH augmentation (dihedral + color permutation)
+    train_dataset = ARCDataset(str(data_dir), split="training", max_grid_size=max_grid_size, augment=True)
+    # Evaluation dataset WITHOUT augmentation (we want consistent results)
+    eval_dataset = ARCDataset(str(data_dir), split="evaluation", max_grid_size=max_grid_size, augment=False)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
@@ -351,12 +403,14 @@ def main():
         max_grid_size=max_grid_size,
         max_recurrent_steps=max_recurrent_steps,
         max_passes=max_passes,
-        dropout=0.1,
+        dropout=0,
     ).to(device)
+
+    print_model_summary(model)
 
     # Higher LR for runpod with cosine schedule
     lr = 3e-4 if preset_name == "runpod" else 1e-4
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)#, weight_decay=0.01)
 
     # Gradient accumulation - effective batch = batch_size * grad_accum_steps
     grad_accum_steps = 2 if preset_name in ["full", "runpod"] else 1

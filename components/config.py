@@ -47,11 +47,12 @@ class FeatureFlags:
     use_layer_id: bool = True           # False = no layer separation in cache
 
     # Architecture improvements
-    use_cache_self_attn: bool = True    # False = no inter-pass cache reasoning
+    use_cache_self_attn: bool = False   # False = no inter-pass cache reasoning (RECOMMENDED: redundant with cache-informed write)
     use_act_halting: bool = True        # False = fixed number of passes (model-level)
     use_layer_act: bool = True          # False = fixed recurrent steps (layer-level)
     use_gated_fusion: bool = True       # False = additive fusion
     use_moe_memory: bool = True         # MoE-style memory routing (should I read? should I write?)
+    use_cache_informed_write: bool = True  # Write decisions informed by cache context (usefulness vs value-add)
     
     # Memory optimization
     detach_cache_between_passes: bool = True  # Detach cache between passes to reduce memory
@@ -76,6 +77,11 @@ class FeatureFlags:
     use_deep_supervision: bool = False   # Train on every pass (memory intensive - disabled by default)
     use_explicit_q_head: bool = True     # Train halt_net as Q-Head (correctness predictor)
     use_answer_feedback: bool = True     # Feed previous pass's answer back (TRM's key insight)
+    use_dual_q_head: bool = True         # TRM: Q_halt + Q_continue (two heads)
+    no_act_continue: bool = True         # TRM: Skip Q_continue loss (paper recommends True)
+    use_refinement_read: bool = True     # TRM: Answer reads from cache before output
+    use_gradient_free_passes: bool = True  # TRM: Run early passes without gradients (memory efficient)
+    gradient_free_ratio: float = 0.5     # Fraction of passes to run without gradients
 
     def describe(self) -> str:
         """Return a string describing enabled features."""
@@ -108,6 +114,10 @@ class FeatureFlags:
         if self.use_deep_supervision: trm.append("deep-sup")
         if self.use_explicit_q_head: trm.append("q-head")
         if self.use_answer_feedback: trm.append("ans-fb")
+        if self.use_dual_q_head: trm.append("dual-q")
+        if self.no_act_continue: trm.append("no-q-cont")  # Paper recommends this
+        if self.use_refinement_read: trm.append("refine")
+        if self.use_gradient_free_passes: trm.append("no-grad")
 
         return (f"Core: [{', '.join(core)}] | "
                 f"Improvements: [{', '.join(improvements)}] | "

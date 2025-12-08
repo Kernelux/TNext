@@ -143,8 +143,8 @@ class MemoryRouter(nn.Module):
         self.read_slot_router = nn.Linear(d_model, num_slots)
         
         # === WRITE (applied to patterns/y) ===
-        # 3. Should I write to cache? (coarse filter)
-        self.write_gate = nn.Sequential(
+        # 3. Should I write to cache? (base gate, before cache context)
+        self.write_gate_base = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.SiLU(),
             nn.Linear(d_model // 2, 1),
@@ -165,6 +165,23 @@ class MemoryRouter(nn.Module):
         # Attention sharpening γ for slot selection
         self.gamma = nn.Parameter(torch.ones(1))
         
+        # === CACHE-INFORMED WRITE ===
+        # Cross-attention: patterns query the global cache to understand context
+        # Then decide usefulness: "Given what's stored, how valuable am I?"
+        self.pattern_to_cache_proj = nn.Linear(d_model, d_cache)
+        
+        # Usefulness scorer: takes pattern + cache_context → usefulness score
+        # This learns "am I valuable given what the cache already knows?"
+        self.usefulness_scorer = nn.Sequential(
+            nn.Linear(d_model + d_cache, d_model // 2),
+            nn.SiLU(),
+            nn.Linear(d_model // 2, 1),
+            nn.Sigmoid(),
+        )
+        
+        # Local slot selection: pattern + local_cache → where to write
+        self.local_slot_scorer = nn.Linear(d_cache * 2, 1)
+        
     def _read(
         self,
         x: torch.Tensor,
@@ -184,25 +201,76 @@ class MemoryRouter(nn.Module):
     def _write(
         self,
         x: torch.Tensor,
+        cache: Optional[torch.Tensor] = None,  # [B, L*K, D_cache] - global cache
+        local_cache: Optional[torch.Tensor] = None,  # [B, K, D_cache] - this layer's slots
         temperature: float = 1.0,
         hard: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        """Write phase routing."""
+        """
+        Cache-INFORMED write phase routing.
+        
+        Decision flow:
+        1. SHOULD I WRITE? - base gate (pattern quality)
+        2. USEFULNESS? - patterns attend to global_cache → "Am I valuable given context?"
+        3. WHERE TO WRITE? - patterns + local_cache → complementary slot selection
+        
+        Key insight: It's not about redundancy, it's about VALUE-ADD.
+        A similar pattern might still be useful if it extends/connects existing knowledge.
+        """
         B, S, D = x.shape
         K = self.num_slots
         
-        write_gate = self.write_gate(x)  # [B, S, 1] - should I write?
-        write_imp = self.write_importance(x)  # [B, S, 1] - how important?
+        # === 1. BASE WRITE GATE (pattern quality) ===
+        write_gate = self.write_gate_base(x)  # [B, S, 1]
         
-        # Where to write? (with Gumbel-Softmax for differentiable routing)
+        # === 2. USEFULNESS GIVEN CACHE CONTEXT ===
+        if cache is not None:
+            # Project patterns to cache space
+            x_cache = self.pattern_to_cache_proj(x)  # [B, S, D_cache]
+            
+            # Patterns attend to global cache: "What does the cache know?"
+            # Simple attention: softmax(Q @ K^T) @ V
+            attn_scores = torch.matmul(x_cache, cache.transpose(-2, -1))  # [B, S, L*K]
+            attn_scores = attn_scores / math.sqrt(self.d_cache)
+            attn_weights = F.softmax(attn_scores, dim=-1)  # [B, S, L*K]
+            cache_context = torch.matmul(attn_weights, cache)  # [B, S, D_cache]
+            
+            # Usefulness: "Given what cache knows, am I valuable?"
+            # Concatenate pattern + cache_context → learned usefulness
+            usefulness_input = torch.cat([x, cache_context], dim=-1)  # [B, S, D + D_cache]
+            usefulness = self.usefulness_scorer(usefulness_input)  # [B, S, 1]
+            
+            # Combine base gate with usefulness
+            write_gate = write_gate * usefulness
+        
+        # === 3. IMPORTANCE SCORE ===
+        write_imp = self.write_importance(x)  # [B, S, 1]
+        
+        # Combined write score = gate × importance
+        write_scores = (write_gate * write_imp).squeeze(-1)  # [B, S]
+        
+        # === 4. WHERE TO WRITE? (slot selection in local cache) ===
+        # Base routing from patterns
         write_slot_logits = self.gamma * self.write_slot_router(x)  # [B, S, K]
+        
+        # If we have local cache, learn complementary placement
+        if local_cache is not None:
+            x_cache = self.pattern_to_cache_proj(x) if cache is None else x_cache  # [B, S, D_cache]
+            
+            # For each pattern, compute fit with each local slot
+            # [B, S, 1, D_cache] × [B, 1, K, D_cache] → [B, S, K, D_cache*2]
+            x_expanded = x_cache.unsqueeze(2).expand(-1, -1, K, -1)  # [B, S, K, D_cache]
+            local_expanded = local_cache.unsqueeze(1).expand(-1, S, -1, -1)  # [B, S, K, D_cache]
+            slot_pairs = torch.cat([x_expanded, local_expanded], dim=-1)  # [B, S, K, D_cache*2]
+            
+            # Learn slot affinity (not just dissimilarity, but learned fit)
+            slot_bias = self.local_slot_scorer(slot_pairs).squeeze(-1)  # [B, S, K]
+            write_slot_logits = write_slot_logits + slot_bias
+        
         if hard:
             write_slot_probs = gumbel_softmax(write_slot_logits, temperature, hard=True)
         else:
             write_slot_probs = gumbel_softmax(write_slot_logits, temperature, hard=False)
-        
-        # Combined write score = gate × importance
-        write_scores = (write_gate * write_imp).squeeze(-1)  # [B, S]
         
         return {
             'write_gate': write_gate,
@@ -212,7 +280,9 @@ class MemoryRouter(nn.Module):
 
     def forward(
         self, 
-        x: torch.Tensor,           # [B, S, D] input tokens
+        x: torch.Tensor,           # [B, S, D] input tokens or patterns
+        cache: Optional[torch.Tensor] = None,  # [B, L*K, D_cache] - global cache (for write)
+        local_cache: Optional[torch.Tensor] = None,  # [B, K, D_cache] - layer's slots (for write)
         temperature: float = 1.0,
         hard: bool = False,
         mode: str = 'read',
@@ -222,12 +292,14 @@ class MemoryRouter(nn.Module):
         
         Args:
             x: Input tensor [B, S, D]
+            cache: Global cache (for cache-informed write decisions)
+            local_cache: This layer's slots (for slot selection)
             mode: 'read' (on input tokens) or 'write' (on patterns)
         """
         if mode == 'read':
             return self._read(x, temperature, hard)
         elif mode == 'write':
-            return self._write(x, temperature, hard)
+            return self._write(x, cache, local_cache, temperature, hard)
         else:
             raise ValueError(f"Invalid mode: {mode}. Must be 'read' or 'write'.")
 

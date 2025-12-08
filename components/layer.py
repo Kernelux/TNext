@@ -334,8 +334,30 @@ class DLSMNLayer(nn.Module):
         
         # === STEP 3: SELECT - decide what to write and where ===
         if features.use_moe_memory:
+            # Extract local cache (this layer's slots) for cache-informed write
+            K = self.num_slots
+            start_idx = self.layer_idx * K
+            end_idx = start_idx + K
+            local_cache = cache[:, start_idx:end_idx, :]  # [B, K, D_cache]
+            
             # Route on patterns (post-computation)
-            pattern_routing = self.memory_router(patterns, temperature=temperature, hard=hard, mode='write')
+            # Pass cache for cache-informed writing if enabled
+            if features.use_cache_informed_write:
+                pattern_routing = self.memory_router(
+                    patterns, 
+                    cache=cache,           # Global cache for usefulness assessment
+                    local_cache=local_cache,  # Local slots for placement decision
+                    temperature=temperature, 
+                    hard=hard, 
+                    mode='write'
+                )
+            else:
+                pattern_routing = self.memory_router(
+                    patterns, 
+                    temperature=temperature, 
+                    hard=hard, 
+                    mode='write'
+                )
             
             selection = {
                 'scores': pattern_routing['write_scores'],

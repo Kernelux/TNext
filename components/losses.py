@@ -72,13 +72,81 @@ def compute_q_head_loss(
 ) -> torch.Tensor:
     """
     [TRM INSIGHT: Explicit Q-Head Loss]
-    Trains the halt_net to predict correctness of the current state.
-    Uses final logits only (not per-pass) for efficiency.
+    
+    Supports two modes:
+    1. Single Q-head (legacy): halt_prob predicts correctness
+    2. Dual Q-head (TRM): q_halt predicts "is_correct", q_continue predicts "is_wrong"
+    
+    The dual Q-head approach from TinyTRM gives cleaner learning signal:
+    - q_halt: BCE(q_halt, is_correct) - learns to say "stop, this is right"
+    - q_continue: BCE(q_continue, is_wrong) - learns to say "continue, this is wrong"
+    
+    This dual signal helps the model learn both when to stop AND when to keep going.
     """
     model_q_loss = torch.tensor(0.0, device=device)
     features = config.features
 
-    if features.use_explicit_q_head and 'halt_probs' in aux_info and aux_info['halt_probs']:
+    if not features.use_explicit_q_head:
+        return model_q_loss
+    
+    # [TRM] Dual Q-head mode - q_halt and q_continue are LOGITS (not probabilities)
+    if features.use_dual_q_head and 'q_halt' in aux_info and aux_info['q_halt']:
+        q_halt_list = aux_info['q_halt']
+        q_continue_list = aux_info['q_continue']
+        
+        if not q_halt_list:
+            return model_q_loss
+        
+        # Get pass logits for computing per-pass correctness
+        pass_logits = aux_info.get('pass_logits', [])
+        final_logits = aux_info.get('final_logits')
+        
+        # [TRM] no_act_continue: Paper recommends skipping Q_continue loss
+        # "No continue ACT loss, only use the sigmoid of the halt which makes much more sense"
+        use_q_continue = not features.no_act_continue
+        
+        # If we have per-pass logits (deep supervision), compute per-pass loss
+        if pass_logits:
+            total_loss = torch.tensor(0.0, device=device)
+            for i, (q_h_logit, q_c_logit, p_logits) in enumerate(zip(q_halt_list, q_continue_list, pass_logits)):
+                # Per-pass correctness
+                preds = p_logits.detach().argmax(dim=-1)
+                is_correct = (preds == test_output).all(dim=-1).all(dim=-1).float()  # [B]
+                
+                # BCE with logits (more numerically stable)
+                loss_halt = F.binary_cross_entropy_with_logits(q_h_logit, is_correct.detach())
+                total_loss = total_loss + loss_halt
+                
+                # Q_continue loss (optional, paper recommends skipping)
+                if use_q_continue:
+                    is_wrong = 1.0 - is_correct
+                    loss_cont = F.binary_cross_entropy_with_logits(q_c_logit, is_wrong.detach())
+                    total_loss = total_loss + loss_cont
+            
+            model_q_loss = total_loss / len(pass_logits)
+        
+        # Otherwise, use final logits only
+        elif final_logits is not None:
+            q_halt_final = q_halt_list[-1]
+            
+            preds = final_logits.detach().argmax(dim=-1)
+            is_correct = (preds == test_output).all(dim=-1).all(dim=-1).float()
+            
+            # BCE with logits (more numerically stable)
+            loss_halt = F.binary_cross_entropy_with_logits(q_halt_final, is_correct.detach())
+            model_q_loss = loss_halt
+            
+            # Q_continue loss (optional, paper recommends skipping)
+            if use_q_continue:
+                q_continue_final = q_continue_list[-1]
+                is_wrong = 1.0 - is_correct
+                loss_cont = F.binary_cross_entropy_with_logits(q_continue_final, is_wrong.detach())
+                model_q_loss = model_q_loss + loss_cont
+        
+        return model_q_loss
+    
+    # Legacy single Q-head mode
+    if 'halt_probs' in aux_info and aux_info['halt_probs']:
         halt_probs = aux_info['halt_probs']
 
         # Use final pass's halt_prob and compare against final correctness
