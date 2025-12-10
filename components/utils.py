@@ -1,6 +1,108 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
+
+
+# ============================================================================
+# Weight Initialization Utilities
+# ============================================================================
+
+def init_linear_kaiming(layer: nn.Linear, nonlinearity: str = 'relu'):
+    """
+    Kaiming/He initialization for linear layers followed by ReLU/SiLU/GELU.
+    
+    Good for: FFN layers, attention projections with nonlinear activations.
+    """
+    nn.init.kaiming_normal_(layer.weight, mode='fan_in', nonlinearity=nonlinearity)
+    if layer.bias is not None:
+        nn.init.zeros_(layer.bias)
+
+
+def init_linear_xavier(layer: nn.Linear):
+    """
+    Xavier/Glorot initialization for linear layers.
+    
+    Good for: Layers followed by Sigmoid/Tanh, or general purpose.
+    """
+    nn.init.xavier_uniform_(layer.weight)
+    if layer.bias is not None:
+        nn.init.zeros_(layer.bias)
+
+
+def init_linear_normal(layer: nn.Linear, std: float = 0.02):
+    """
+    Normal initialization with small std for stable training.
+    
+    Good for: Output projections, embeddings, residual branches.
+    """
+    nn.init.normal_(layer.weight, mean=0.0, std=std)
+    if layer.bias is not None:
+        nn.init.zeros_(layer.bias)
+
+
+def init_embedding(embedding: nn.Embedding, std: float = 0.02):
+    """
+    Initialize embedding with small normal values.
+    """
+    nn.init.normal_(embedding.weight, mean=0.0, std=std)
+
+
+def init_layer_norm(layer_norm: nn.LayerNorm):
+    """
+    Initialize LayerNorm to identity (weight=1, bias=0).
+    """
+    nn.init.ones_(layer_norm.weight)
+    nn.init.zeros_(layer_norm.bias)
+
+
+def init_gate_bias(layer: nn.Linear, initial_value: float = 0.0):
+    """
+    Initialize gate output bias to control initial gate behavior.
+    
+    - bias=0: gates start at sigmoid(0) = 0.5 (50% gating)
+    - bias=-2: gates start at sigmoid(-2) ≈ 0.12 (mostly closed)
+    - bias=+2: gates start at sigmoid(+2) ≈ 0.88 (mostly open)
+    """
+    if layer.bias is not None:
+        nn.init.constant_(layer.bias, initial_value)
+
+
+def init_sequential(seq: nn.Sequential, final_is_gate: bool = False, gate_bias: float = 0.0):
+    """
+    Initialize a Sequential module with appropriate methods per layer type.
+    
+    Args:
+        seq: nn.Sequential to initialize
+        final_is_gate: If True, the final Linear outputs a gate (sigmoid)
+        gate_bias: Initial bias for gate output (if final_is_gate=True)
+    """
+    layers = list(seq.children())
+    for i, layer in enumerate(layers):
+        if isinstance(layer, nn.Linear):
+            is_last = (i == len(layers) - 1) or (i == len(layers) - 2 and isinstance(layers[-1], nn.Sigmoid))
+            
+            if is_last and final_is_gate:
+                # Gate output: Xavier + custom bias
+                init_linear_xavier(layer)
+                init_gate_bias(layer, gate_bias)
+            elif i < len(layers) - 1:
+                # Hidden layer followed by activation
+                next_layer = layers[i + 1] if i + 1 < len(layers) else None
+                if isinstance(next_layer, (nn.ReLU, nn.SiLU, nn.GELU)):
+                    init_linear_kaiming(layer, nonlinearity='relu')  # SiLU/GELU similar to ReLU
+                else:
+                    init_linear_xavier(layer)
+            else:
+                # Final non-gate layer
+                init_linear_normal(layer, std=0.02)
+        elif isinstance(layer, nn.LayerNorm):
+            init_layer_norm(layer)
+
+
+# ============================================================================
+# Gumbel-Softmax
+# ============================================================================
 
 def gumbel_softmax(logits: torch.Tensor, temperature: float = 1.0, hard: bool = False) -> torch.Tensor:
     """
@@ -9,9 +111,12 @@ def gumbel_softmax(logits: torch.Tensor, temperature: float = 1.0, hard: bool = 
     During training with high temperature: soft routing (all slots receive updates)
     As temperature → 0: converges to hard one-hot selection
     """
+    # Clamp logits to prevent numerical issues in softmax
+    logits = logits.clamp(min=-20.0, max=20.0)
+    
     # Sample Gumbel noise
-    gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8)
-    y_soft = F.softmax((logits + gumbel_noise) / temperature, dim=-1)
+    gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits).clamp(min=1e-8, max=1.0-1e-8)) + 1e-8)
+    y_soft = F.softmax((logits + gumbel_noise) / max(temperature, 0.01), dim=-1)
     
     if hard:
         # Straight-through: hard forward, soft backward

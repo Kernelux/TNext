@@ -47,24 +47,22 @@ class FeatureFlags:
     use_layer_id: bool = True           # False = no layer separation in cache
 
     # Architecture improvements
-    use_cache_self_attn: bool = False   # False = no inter-pass cache reasoning (RECOMMENDED: redundant with cache-informed write)
+    use_cache_self_attn: bool = True    # Cache-to-cache attention AFTER each layer's write (pass-aware)
+    use_between_pass_consolidation: bool = False  # Additional "sleep-like" consolidation between passes
     use_act_halting: bool = True        # False = fixed number of passes (model-level)
     use_layer_act: bool = True          # False = fixed recurrent steps (layer-level)
     use_gated_fusion: bool = True       # False = additive fusion
     use_moe_memory: bool = True         # MoE-style memory routing (should I read? should I write?)
     use_cache_informed_write: bool = True  # Write decisions informed by cache context (usefulness vs value-add)
     
-    # Memory optimization
-    detach_cache_between_passes: bool = True  # Detach cache between passes to reduce memory
+    # Memory optimization (not gradient-related - AdamAtan2 handles gradient magnitude)
+    detach_cache_between_passes: bool = False  # With AdamAtan2, we can backprop through cache
     use_linear_attention: bool = True   # Use O(S) linear attention instead of O(S²) softmax attention
-
-    # Pattern pooling
-    use_pattern_pooling: bool = True    # False = direct token caching
 
     # === AUXILIARY LOSSES (simplified) ===
     use_diversity_loss: bool = True     # Prevent slot collapse (warmup only)
-    use_ponder_loss: bool = True        # Penalize excessive passes (ACT only)
-    # REMOVED: balance (redundant with diversity), sparsity (redundant with Gumbel),
+    # REMOVED: ponder_loss (redundant with dual Q-head which learns task-aware halting),
+    #          balance (redundant with diversity), sparsity (redundant with Gumbel),
     #          consistency (over-engineered, no evidence it helps)
 
     # === REFINEMENTS (from review) ===
@@ -75,13 +73,15 @@ class FeatureFlags:
 
     # === TRM INSIGHTS (ref/2510.04871v1.pdf) ===
     use_deep_supervision: bool = False   # Train on every pass (memory intensive - disabled by default)
-    use_explicit_q_head: bool = True     # Train halt_net as Q-Head (correctness predictor)
     use_answer_feedback: bool = True     # Feed previous pass's answer back (TRM's key insight)
-    use_dual_q_head: bool = True         # TRM: Q_halt + Q_continue (two heads)
     no_act_continue: bool = True         # TRM: Skip Q_continue loss (paper recommends True)
     use_refinement_read: bool = True     # TRM: Answer reads from cache before output
-    use_gradient_free_passes: bool = True  # TRM: Run early passes without gradients (memory efficient)
-    gradient_free_ratio: float = 0.5     # Fraction of passes to run without gradients
+    use_gradient_free_passes: bool = False  # With AdamAtan2, train all passes (no gradient explosion)
+    # NOTE: Set to True if you run out of memory on multi-pass training
+
+    # === POSITION ENCODING (TRM insight: RoPE saves params) ===
+    # Options: "rope" (zero params), "learned" (heavy ~1.6M), "none"
+    pos_encoding: str = "rope"           # Default to RoPE like TRM
 
     def describe(self) -> str:
         """Return a string describing enabled features."""
@@ -98,11 +98,9 @@ class FeatureFlags:
         if self.use_cache_self_attn: improvements.append("cache-attn")
         if self.use_act_halting: improvements.append("ACT")
         if self.use_gated_fusion: improvements.append("gated")
-        if self.use_pattern_pooling: improvements.append("patterns")
 
         losses = []
         if self.use_diversity_loss: losses.append("div")
-        if self.use_ponder_loss: losses.append("ponder")
 
         refinements = []
         if self.use_write_count_masking: refinements.append("masking")
@@ -112,9 +110,7 @@ class FeatureFlags:
 
         trm = []
         if self.use_deep_supervision: trm.append("deep-sup")
-        if self.use_explicit_q_head: trm.append("q-head")
         if self.use_answer_feedback: trm.append("ans-fb")
-        if self.use_dual_q_head: trm.append("dual-q")
         if self.no_act_continue: trm.append("no-q-cont")  # Paper recommends this
         if self.use_refinement_read: trm.append("refine")
         if self.use_gradient_free_passes: trm.append("no-grad")
@@ -144,9 +140,7 @@ FEATURE_PRESETS = {
         use_cache_self_attn=False,
         use_act_halting=False,
         use_gated_fusion=False,
-        use_pattern_pooling=False,
         use_diversity_loss=False,
-        use_ponder_loss=False,
     ),
 
     # No multi-pass (single pass baseline)
@@ -154,7 +148,6 @@ FEATURE_PRESETS = {
         use_multi_pass=False,
         use_cache_self_attn=False,
         use_act_halting=False,
-        use_ponder_loss=False,
     ),
 
     # No Gumbel-Softmax (hard routing from start)
@@ -172,7 +165,6 @@ FEATURE_PRESETS = {
     # No auxiliary losses
     "no_aux_loss": FeatureFlags(
         use_diversity_loss=False,
-        use_ponder_loss=False,
     ),
 
     # Fast training (minimal overhead)
@@ -180,15 +172,11 @@ FEATURE_PRESETS = {
         use_multi_pass=False,
         use_cache_self_attn=False,
         use_act_halting=False,
-        use_ponder_loss=False,
-        use_pattern_pooling=False,
     ),
 
     # Runpod optimized - balanced for ARC evaluation with memory constraints
     "runpod": FeatureFlags(
         use_diversity_loss=True,     # Keep diversity to prevent slot collapse
-        use_ponder_loss=True,        # Keep ponder for efficiency
-        use_explicit_q_head=True,    # Keep Q-head for halting prediction
         use_answer_feedback=True,    # Keep answer feedback mechanism
     ),
 }
@@ -207,6 +195,11 @@ class TrainingConfig:
     - Start at max capacity (full passes, full recurrent steps)
     - Efficiency losses push model to use fewer when it can
     - No warmup/transition phases - train directly
+    
+    Curriculum Learning (optional):
+    - Start with 1 pass, 1 recurrence for stable gradient flow
+    - Gradually increase to max as training progresses
+    - Helps prevent gradient collapse in deep computation chains
     """
     # Temperature for Gumbel-Softmax routing
     tau_start: float = 1.0       # Initial temperature (soft routing)
@@ -215,9 +208,8 @@ class TrainingConfig:
 
     # Loss weights
     lambda_diversity: float = 0.01   # Prevents slot collapse
-    lambda_ponder: float = 0.05      # Penalizes excessive passes (increased - key for efficiency)
-    lambda_q_head: float = 0.1       # Q-head correctness predictor
-    lambda_step_efficiency: float = 0.05  # Layer-level step efficiency (increased)
+    lambda_q_head: float = 0.1       # Q-head correctness predictor (pass-level halting)
+    lambda_step_efficiency: float = 0.5  # Layer-level step efficiency
 
     # Importance threshold
     write_threshold: float = 0.5
@@ -226,9 +218,15 @@ class TrainingConfig:
     alpha_learned: float = 1.0  # 1.0 = pure learned routing
 
     # Compute budget (model starts at max, learns to reduce)
-    max_passes: int = 8           # Maximum thinking passes
-    max_recurrent_steps: int = 4  # Maximum refinement steps per layer
+    max_passes: int = 10           # Maximum thinking passes
+    max_recurrent_steps: int = 10  # Maximum refinement steps per layer
 
+    # === CURRICULUM LEARNING ===
+    # Start simple (1 pass, 1 recurrence), gradually increase
+    use_curriculum: bool = False           # Enable curriculum learning
+    curriculum_warmup_steps: int = 135    # Steps before increasing complexity
+    curriculum_increase_every: int = 135  # Steps between each increase
+    
     # EMA for training stability
     use_ema: bool = True
     ema_decay: float = 0.999
@@ -239,6 +237,44 @@ class TrainingConfig:
     def get_temperature(self, step: int) -> float:
         """Gumbel-Softmax temperature schedule."""
         return max(self.tau_min, self.tau_start * math.exp(-self.anneal_rate * step))
+    
+    def get_curriculum_passes(self, step: int) -> int:
+        """
+        Get effective number of passes based on curriculum schedule.
+        
+        Starts at 1, increases by 1 every `curriculum_increase_every` steps
+        after `curriculum_warmup_steps`, up to `max_passes`.
+        """
+        if not self.use_curriculum:
+            return self.max_passes
+        
+        if step < self.curriculum_warmup_steps:
+            return 1
+        
+        # How many increases after warmup?
+        steps_after_warmup = step - self.curriculum_warmup_steps
+        num_increases = steps_after_warmup // self.curriculum_increase_every
+        
+        # Start at 1, increase up to max_passes
+        return min(1 + num_increases, self.max_passes)
+    
+    def get_curriculum_recurrence(self, step: int) -> int:
+        """
+        Get effective number of recurrent steps based on curriculum schedule.
+        
+        Same schedule as passes - starts at 1, increases gradually.
+        """
+        if not self.use_curriculum:
+            return self.max_recurrent_steps
+        
+        if step < self.curriculum_warmup_steps:
+            return 1
+        
+        steps_after_warmup = step - self.curriculum_warmup_steps
+        num_increases = steps_after_warmup // self.curriculum_increase_every
+        
+        return min(1 + num_increases, self.max_recurrent_steps)
+    
     def get_pass_mode(self, step: int, training: bool = True) -> str:
         """
         Pass mode for adaptive computation.
