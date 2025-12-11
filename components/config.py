@@ -72,12 +72,18 @@ class FeatureFlags:
     use_soft_wta_update: bool = True     # Use exponential weighting for updates
 
     # === TRM INSIGHTS (ref/2510.04871v1.pdf) ===
-    use_deep_supervision: bool = False   # Train on every pass (memory intensive - disabled by default)
+    use_deep_supervision: bool = True    # Train on every pass with weighted loss
     use_answer_feedback: bool = True     # Feed previous pass's answer back (TRM's key insight)
     no_act_continue: bool = True         # TRM: Skip Q_continue loss (paper recommends True)
     # NOTE: use_refinement_read removed - refinement happens through multi-pass mechanism
     use_gradient_free_passes: bool = False  # With AdamAtan2, train all passes (no gradient explosion)
     # NOTE: Set to True if you run out of memory on multi-pass training
+    
+    # === HALTING DURING TRAINING ===
+    halt_exploration_prob: float = 0.3   # Prob of continuing despite confidence (ε-greedy exploration)
+    deep_supervision_decay: float = 0.8  # Weight decay for earlier passes (later = more important)
+    use_ponder_cost: bool = True         # Penalize using more passes than needed
+    ponder_cost_weight: float = 0.01     # Weight of ponder cost in total loss
 
     # === POSITION ENCODING (TRM insight: RoPE saves params) ===
     # Options: "rope" (zero params), "learned" (heavy ~1.6M), "none"
@@ -206,10 +212,15 @@ class TrainingConfig:
     tau_min: float = 0.5         # Final temperature (keep softer to prevent NaN)
     anneal_rate: float = 0.0003  # Slower annealing for stability
 
-    # Loss weights
+    # Loss weights - Task
     lambda_diversity: float = 0.01   # Prevents slot collapse
     lambda_q_head: float = 0.1       # Q-head correctness predictor (pass-level halting)
     lambda_step_efficiency: float = 0.5  # Layer-level step efficiency
+    
+    # Loss weights - Confidence-based (NEW)
+    lambda_confidence_calibration: float = 0.5   # Align confidence with actual correctness
+    lambda_halt_prediction: float = 0.3          # Train halt to predict sequence correctness
+    lambda_confidence_monotonicity: float = 0.1  # Later passes should have higher confidence
 
     # Importance threshold
     write_threshold: float = 0.5

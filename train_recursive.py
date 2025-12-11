@@ -18,6 +18,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from torch.amp import autocast, GradScaler
+from contextlib import nullcontext
 from tqdm import tqdm
 import os
 import time
@@ -197,29 +199,26 @@ def visualize_sample(
             lines.append(f"  Pass Confidences: [{conf_str}]")
         
         # Feedback gates
-        answer_fb = aux.get('answer_feedback_gates', [])
-        iter_fb = aux.get('iteration_feedback_gates', [])
-        if answer_fb or iter_fb:
-            fb_parts = []
-            if answer_fb:
-                avg_ans = torch.stack(answer_fb).mean().item()
-                fb_parts.append(f"answer={avg_ans:.3f}")
-            if iter_fb:
-                avg_iter = torch.stack(iter_fb).mean().item()
-                fb_parts.append(f"thought={avg_iter:.3f}")
+        # Feedback gates (now scalars)
+        fb_parts = []
+        if aux.get('answer_feedback_count', 0) > 0:
+            avg_ans = aux['answer_feedback_sum'] / aux['answer_feedback_count']
+            fb_parts.append(f"answer={avg_ans:.3f}")
+        if aux.get('iteration_feedback_count', 0) > 0:
+            avg_iter = aux['iteration_feedback_sum'] / aux['iteration_feedback_count']
+            fb_parts.append(f"thought={avg_iter:.3f}")
+        if fb_parts:
             lines.append(f"  Feedback Gates: {', '.join(fb_parts)}")
         
-        # Memory gates
-        read_gates = aux.get('read_gates', [])
-        write_gates = aux.get('write_gates', [])
-        if read_gates or write_gates:
-            gate_parts = []
-            if read_gates:
-                all_read = torch.cat([g.view(-1) for g in read_gates])
-                gate_parts.append(f"read={all_read.mean().item():.3f}")
-            if write_gates:
-                all_write = torch.cat([g.view(-1) for g in write_gates])
-                gate_parts.append(f"write={all_write.mean().item():.3f}")
+        # Memory gates (now scalars)
+        gate_parts = []
+        if aux.get('read_gate_count', 0) > 0:
+            avg_read = aux['read_gate_sum'] / aux['read_gate_count']
+            gate_parts.append(f"read={avg_read:.3f}")
+        if aux.get('write_gate_count', 0) > 0:
+            avg_write = aux['write_gate_sum'] / aux['write_gate_count']
+            gate_parts.append(f"write={avg_write:.3f}")
+        if gate_parts:
             lines.append(f"  Memory Gates: {', '.join(gate_parts)}")
     
     lines.append(f"{'='*70}")
@@ -352,67 +351,46 @@ def compute_recursive_loss(
     """
     Compute loss for recursive refinement model.
     
-    Components:
-    1. Task loss: Cross-entropy on predictions
-    2. Compute efficiency loss: Encourage minimal passes/iterations
-    3. Gate regularization: Encourage polarized gates
+    Now uses comprehensive loss from losses.py which includes:
+    1. Task loss with deep supervision
+    2. Confidence calibration (confidence ≈ correctness)
+    3. Halt prediction (Q-learning style)
+    4. Confidence monotonicity (later passes = higher confidence)
+    5. Adaptive ponder cost (penalize redundant computation)
+    6. Early exit bonus (reward efficient correct halts)
+    7. Gate regularization
+    8. Diversity losses
     """
-    IGNORE_LABEL = -100
+    from components.losses import compute_total_loss
     
-    # === 1. Task Loss (Primary) ===
-    # logits: [B, S, vocab_size], targets: [B, S]
-    loss_task = F.cross_entropy(
-        logits.reshape(-1, logits.size(-1)),
-        targets.reshape(-1),
-        ignore_index=IGNORE_LABEL,
-        label_smoothing=0.1,
+    # Use the comprehensive loss function from losses.py
+    total_loss, metrics = compute_total_loss(
+        model=model,
+        logits=logits,
+        test_output=targets,
+        aux_info=aux,
+        config=config,
+        global_step=step,
+        device=device,
     )
     
-    metrics = {'loss_task': loss_task.item()}
-    total_loss = loss_task
-    
-    # === 2. Compute Efficiency Loss ===
-    # Encourage model to use fewer passes/iterations when confident
-    if config.lambda_step_efficiency > 0 and aux.get('passes_run', 1) > 1:
-        # Penalize using many passes when already confident
-        pass_confs = aux.get('pass_confidences', [])
-        if pass_confs:
-            # Average confidence across passes (should be high early if task is easy)
-            avg_conf = torch.stack([c.mean() for c in pass_confs]).mean()
-            passes_used = aux['passes_run']
-            max_passes = model.max_passes
-            
-            # Loss: (1 - confidence) * pass_utilization
-            # High confidence + many passes → penalty
-            pass_util = passes_used / max_passes
-            efficiency_loss = (1.0 - avg_conf) * pass_util + avg_conf * pass_util * 0.1
-            
-            total_loss = total_loss + config.lambda_step_efficiency * efficiency_loss
-            metrics['loss_efficiency'] = efficiency_loss.item()
-    
-    # === 3. Gate Regularization ===
-    # Encourage gates to be polarized (0 or 1)
-    # Using lambda_diversity as a proxy since lambda_gate_polar doesn't exist
-    lambda_gate_polar = 0.01  # Hardcoded for now
-    if lambda_gate_polar > 0:
-        read_gates = aux.get('read_gates', [])
-        write_gates = aux.get('write_gates', [])
+    # Add pass-level metrics for deep supervision tracking
+    if config.features.use_deep_supervision:
+        pass_logits = aux.get('pass_logits', [])
+        IGNORE_LABEL = -100
         
-        all_gates = read_gates + write_gates
-        if all_gates:
-            gate_tensor = torch.cat([g.view(-1) for g in all_gates])
-            # Polarization: maximize variance → gates near 0 or 1
-            gate_polar_loss = -torch.var(gate_tensor)
-            total_loss = total_loss + lambda_gate_polar * gate_polar_loss
-            metrics['loss_gate_polar'] = gate_polar_loss.item()
+        for i, pass_logit in enumerate(pass_logits):
+            pass_loss = F.cross_entropy(
+                pass_logit.reshape(-1, pass_logit.size(-1)),
+                targets.reshape(-1),
+                ignore_index=IGNORE_LABEL,
+                label_smoothing=0.1,
+            )
+            metrics[f'loss_pass_{i}'] = pass_loss.detach().item()
     
-    # === 4. Diversity Loss (Cache diversity) ===
-    # Encourage diverse cache representations
-    if config.lambda_diversity > 0:
-        # This would need cache from aux, simplified for now
-        pass
-    
-    metrics['loss_total'] = total_loss.item()
+    # Add halting info
+    metrics['halted_early'] = aux.get('halted_early', False)
+    metrics['passes_run'] = aux.get('passes_run', 1)
     
     return total_loss, metrics
 
@@ -431,6 +409,8 @@ def train_epoch(
     writer: Optional[SummaryWriter] = None,
     log_interval: int = 10,
     grad_accum_steps: int = 1,
+    use_amp: bool = False,
+    scaler: Optional[GradScaler] = None,
 ) -> Tuple[float, float, float, int]:
     """Training epoch for RecursiveRefinementModel."""
     model.train()
@@ -442,6 +422,17 @@ def train_epoch(
     
     IGNORE_LABEL = -100
     
+    # Determine autocast dtype based on device
+    if use_amp:
+        if device.type == 'mps':
+            amp_dtype = torch.float16  # MPS doesn't support bfloat16 well
+        elif device.type == 'cuda' and torch.cuda.is_bf16_supported():
+            amp_dtype = torch.bfloat16
+        else:
+            amp_dtype = torch.float16
+    else:
+        amp_dtype = None
+    
     pbar = tqdm(dataloader, desc="Train", leave=False)
     for batch_idx, batch in enumerate(pbar):
         demo_inputs = batch["demo_inputs"].to(device)
@@ -452,36 +443,55 @@ def train_epoch(
         if batch_idx % grad_accum_steps == 0:
             optimizer.zero_grad()
         
-        # Forward pass
-        logits, cache, aux = model(
-            demo_inputs, demo_outputs, test_input,
-            config=config,
-            step=global_step,
-            return_aux=True,
-        )
+        # Forward pass with optional mixed precision
+        amp_context = autocast(device.type, dtype=amp_dtype) if use_amp else nullcontext()
+        with amp_context:
+            logits, cache, aux = model(
+                demo_inputs, demo_outputs, test_input,
+                config=config,
+                step=global_step,
+                return_aux=True,
+            )
+            
+            # Compute loss
+            loss, metrics = compute_recursive_loss(
+                model, logits, test_output,
+                aux, config, global_step, device
+            )
         
-        # Compute loss
-        loss, metrics = compute_recursive_loss(
-            model, logits, test_output,
-            aux, config, global_step, device
-        )
-        
-        # Backward
+        # Backward with scaler if using AMP
         scaled_loss = loss / grad_accum_steps
-        scaled_loss.backward()
+        if use_amp and scaler is not None:
+            scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
         
         # Optimizer step
         if (batch_idx + 1) % grad_accum_steps == 0:
-            # Check for NaN gradients
-            has_nan = any(
-                torch.isnan(p.grad).any() or torch.isinf(p.grad).any()
-                for p in model.parameters() if p.grad is not None
-            )
-            if has_nan:
-                print(f"[Step {global_step}] Skipping due to NaN/Inf gradients")
-                optimizer.zero_grad()
+            if use_amp and scaler is not None:
+                scaler.unscale_(optimizer)
+                # Check for NaN gradients
+                has_nan = any(
+                    torch.isnan(p.grad).any() or torch.isinf(p.grad).any()
+                    for p in model.parameters() if p.grad is not None
+                )
+                if has_nan:
+                    print(f"[Step {global_step}] Skipping due to NaN/Inf gradients")
+                    optimizer.zero_grad()
+                else:
+                    scaler.step(optimizer)
+                scaler.update()
             else:
-                optimizer.step()
+                # Check for NaN gradients
+                has_nan = any(
+                    torch.isnan(p.grad).any() or torch.isinf(p.grad).any()
+                    for p in model.parameters() if p.grad is not None
+                )
+                if has_nan:
+                    print(f"[Step {global_step}] Skipping due to NaN/Inf gradients")
+                    optimizer.zero_grad()
+                else:
+                    optimizer.step()
         
         loss_val = loss.detach().item()
         total_loss += loss_val
@@ -510,6 +520,24 @@ def train_epoch(
             if 'loss_gate_polar' in metrics:
                 writer.add_scalar('Loss/gate_polar', metrics['loss_gate_polar'], global_step)
             
+            # === Deep Supervision Metrics ===
+            if 'loss_task_weighted' in metrics:
+                writer.add_scalar('Loss/task_weighted', metrics['loss_task_weighted'], global_step)
+            # Log per-pass losses
+            for key, val in metrics.items():
+                if key.startswith('loss_pass_'):
+                    writer.add_scalar(f'DeepSupervision/{key}', val, global_step)
+            
+            # === Ponder Cost ===
+            if 'ponder_cost' in metrics:
+                writer.add_scalar('Compute/ponder_cost', metrics['ponder_cost'], global_step)
+            if 'loss_ponder' in metrics:
+                writer.add_scalar('Loss/ponder', metrics['loss_ponder'], global_step)
+            
+            # === Halting Stats ===
+            if 'halted_early' in metrics:
+                writer.add_scalar('Compute/halted_early', float(metrics['halted_early']), global_step)
+            
             writer.add_scalar('Metrics/cell_accuracy', cell_acc, global_step)
             writer.add_scalar('Metrics/task_accuracy', task_acc, global_step)
             
@@ -533,29 +561,23 @@ def train_epoch(
             writer.add_scalar('Compute/total_utilization', actual_compute / max(max_compute, 1), global_step)
             
             # === Feedback Gate Statistics ===
-            # Model-level answer feedback
-            answer_fb_gates = aux.get('answer_feedback_gates', [])
-            if answer_fb_gates:
-                avg_answer_fb = torch.stack(answer_fb_gates).mean().item()
+            # Model-level answer feedback (now scalar)
+            if aux.get('answer_feedback_count', 0) > 0:
+                avg_answer_fb = aux['answer_feedback_sum'] / aux['answer_feedback_count']
                 writer.add_scalar('Feedback/answer_gate_mean', avg_answer_fb, global_step)
             
-            # Layer-level thought injection
-            iter_fb_gates = aux.get('iteration_feedback_gates', [])
-            if iter_fb_gates:
-                avg_iter_fb = torch.stack(iter_fb_gates).mean().item()
+            # Layer-level thought injection (now scalar)
+            if aux.get('iteration_feedback_count', 0) > 0:
+                avg_iter_fb = aux['iteration_feedback_sum'] / aux['iteration_feedback_count']
                 writer.add_scalar('Feedback/iteration_gate_mean', avg_iter_fb, global_step)
             
-            # === Memory Gate Statistics ===
-            read_gates = aux.get('read_gates', [])
-            write_gates = aux.get('write_gates', [])
-            if read_gates:
-                all_read = torch.cat([g.view(-1) for g in read_gates])
-                writer.add_scalar('Gates/read_mean', all_read.mean().item(), global_step)
-                writer.add_scalar('Gates/read_std', all_read.std().item(), global_step)
-            if write_gates:
-                all_write = torch.cat([g.view(-1) for g in write_gates])
-                writer.add_scalar('Gates/write_mean', all_write.mean().item(), global_step)
-                writer.add_scalar('Gates/write_std', all_write.std().item(), global_step)
+            # === Memory Gate Statistics (now scalar) ===
+            if aux.get('read_gate_count', 0) > 0:
+                avg_read = aux['read_gate_sum'] / aux['read_gate_count']
+                writer.add_scalar('Gates/read_mean', avg_read, global_step)
+            if aux.get('write_gate_count', 0) > 0:
+                avg_write = aux['write_gate_sum'] / aux['write_gate_count']
+                writer.add_scalar('Gates/write_mean', avg_write, global_step)
             
             # === Confidence Tracking ===
             pass_confs = aux.get('pass_confidences', [])
@@ -596,14 +618,17 @@ def train_epoch(
                 print(f"[WARN] Image logging failed: {e}")
         
         # Progress bar
+        # P = Model passes (how many times we ran the full architecture)
+        # I = Layer iterations (average internal iterations per layer per pass)
         passes = aux.get('passes_run', 1)
-        avg_iters = sum(aux.get('layer_iterations', [1])) / max(len(aux.get('layer_iterations', [1])), 1)
+        layer_iters = aux.get('layer_iterations', [1])
+        avg_iters = sum(layer_iters) / max(len(layer_iters), 1)
         pbar.set_postfix({
             'loss': f'{loss_val:.3f}',
             'cell': f'{cell_acc:.3f}',
             'task': f'{task_acc:.3f}',
-            'P': f'{passes}',
-            'I': f'{avg_iters:.1f}',
+            'Pass': f'{passes}',        # Model-level: full architecture passes
+            'LayerIt': f'{avg_iters:.1f}',  # Layer-level: avg iterations within each layer
         })
         
         # Memory cleanup
@@ -761,9 +786,10 @@ def main():
     # Model configuration per preset
     if preset_name == "fast_full":
         d_model, d_cache = 64, 48
-        num_layers, num_slots, num_heads = 4, 32, 2
-        batch_size = 8
-        max_passes, max_internal_iterations = 4, 4
+        num_layers, num_slots, num_heads = 4, 16, 2  # Reduced layers and slots
+        batch_size = 1  # Single sample - 30x30 grids are huge!
+        max_passes, max_internal_iterations = 5, 5  # Reduced recursion
+        grad_accum_steps = 2  # Compensate for tiny batch
     elif preset_name == "runpod":
         d_model, d_cache = 128, 64
         num_layers, num_slots, num_heads = 4, 16, 4
@@ -824,11 +850,28 @@ def main():
         model.parameters(),
         lr=lr,
         betas=(0.9, 0.95),
-        weight_decay=0.1,
+        #weight_decay=0.1,
     )
     print(f"Using AdamAtan2 optimizer (lr={lr})")
     
-    grad_accum_steps = 2 if preset_name in ["full", "runpod"] else 1
+    # Gradient accumulation - use preset value if set, otherwise default
+    if preset_name == "fast_full":
+        grad_accum_steps = 8  # Compensate for batch_size=1
+    elif preset_name in ["full", "runpod"]:
+        grad_accum_steps = 2
+    else:
+        grad_accum_steps = 1
+    print(f"Gradient accumulation steps: {grad_accum_steps}, effective batch: {batch_size * grad_accum_steps}")
+    
+    # Mixed precision training (reduces memory by ~50%)
+    # Note: MPS has issues with float16, so disable AMP for MPS
+    use_amp = (device.type == 'cuda')  # Only enable for CUDA
+    if use_amp:
+        scaler = GradScaler()
+        print("Using mixed precision (AMP) with GradScaler")
+    else:
+        scaler = None
+        print(f"Using full precision (fp32) - AMP disabled for {device.type}")
     
     # Logging
     log_dir = Path("logs") / f"recursive_{preset_name}_{time.strftime('%Y%m%d_%H%M%S')}"
@@ -843,6 +886,7 @@ def main():
         train_loss, train_cell_acc, train_task_acc, global_step = train_epoch(
             model, train_loader, optimizer, device, config, global_step,
             writer=writer, log_interval=10, grad_accum_steps=grad_accum_steps,
+            use_amp=use_amp, scaler=scaler,
         )
         
         writer.add_scalar('Epoch/train_loss', train_loss, epoch)

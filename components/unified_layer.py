@@ -37,6 +37,7 @@ import torch.nn.functional as F
 import math
 from typing import Optional, Dict, Tuple
 from contextlib import nullcontext
+from torch.utils.checkpoint import checkpoint
 
 from .memory_controller import MemoryController, ConfidenceEstimator
 from .modules import LinearAttention, CosSin
@@ -152,6 +153,7 @@ class UnifiedMemoryLayer(nn.Module):
         dropout: float = 0.1,
         max_write_tokens: int = 64,
         use_linear_attention: bool = True,
+        use_checkpoint: bool = False,  # Gradient checkpointing for memory savings
     ):
         super().__init__()
         self.d_model = d_model
@@ -159,6 +161,7 @@ class UnifiedMemoryLayer(nn.Module):
         self.num_slots = num_slots
         self.layer_idx = layer_idx
         self.max_write_tokens = max_write_tokens
+        self.use_checkpoint = use_checkpoint
         
         # === Core Components ===
         
@@ -198,7 +201,7 @@ class UnifiedMemoryLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,                       # [B, S, D_model]
-        cache: torch.Tensor,                   # [B, L*K, D_cache]
+        cache: torch.Tensor,                   # [B, L*K, D_slot]
         cos_sin: Optional[CosSin] = None,      # RoPE embeddings
         input_injection: Optional[torch.Tensor] = None,  # TRM-style injection
         temperature: float = 1.0,
@@ -206,13 +209,14 @@ class UnifiedMemoryLayer(nn.Module):
         max_iterations: int = 1,               # For recursive refinement
         confidence_threshold: float = 0.9,     # Early stopping threshold
         return_all_iterations: bool = False,   # Return intermediate states
+        pass_idx: int = 0,                     # Current model-level pass (for temporal embedding)
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
         Forward pass with optional recursive refinement.
         
         Args:
             x: Input tensor [B, S, D_model]
-            cache: Global cache [B, L*K, D_cache]
+            cache: Global cache [B, L*K, D_slot] (content + metadata)
             cos_sin: RoPE embeddings for attention
             input_injection: Added to input (TRM-style gradient path)
             temperature: Gumbel-softmax temperature
@@ -220,10 +224,11 @@ class UnifiedMemoryLayer(nn.Module):
             max_iterations: Max refinement iterations within layer
             confidence_threshold: Stop if confidence exceeds this
             return_all_iterations: Return all intermediate outputs
+            pass_idx: Current model-level pass (for temporal embedding in write)
         
         Returns:
             output: Final output [B, S, D_model]
-            updated_cache: Final cache [B, L*K, D_cache]
+            updated_cache: Final cache [B, L*K, D_slot]
             aux: Auxiliary information dict
         """
         # TRM-style input injection
@@ -232,15 +237,20 @@ class UnifiedMemoryLayer(nn.Module):
         
         B, S, _ = x.shape
         
-        # Track auxiliary information
+        # Track auxiliary information - use scalars to save memory
         aux = {
-            'read_gates': [],
-            'write_gates': [],
-            'confidences': [],
-            'iteration_feedback_gates': [],  # Track feedback gating
+            'read_gate_sum': 0.0,
+            'read_gate_count': 0,
+            'write_gate_sum': 0.0,
+            'write_gate_count': 0,
+            'confidence_sum': 0.0,
+            'confidence_count': 0,
+            'iteration_feedback_sum': 0.0,
+            'iteration_feedback_count': 0,
             'iterations_run': 0,
         }
         
+        # Only store tensors if explicitly requested (for debugging)
         if return_all_iterations:
             aux['all_outputs'] = []
         
@@ -262,7 +272,8 @@ class UnifiedMemoryLayer(nn.Module):
                 gate_input = torch.cat([h, h_prev], dim=-1)
                 feedback_gate = self.iteration_feedback_gate(gate_input)
                 h = h + feedback_gate * h_prev  # Gated residual from previous iteration
-                aux['iteration_feedback_gates'].append(feedback_gate.mean().detach())
+                aux['iteration_feedback_sum'] += feedback_gate.mean().detach().item()
+                aux['iteration_feedback_count'] += 1
             
             # --- Step 1: MEMORY READ ---
             read_result = self.memory.read(
@@ -271,10 +282,17 @@ class UnifiedMemoryLayer(nn.Module):
                 hard=hard,
             )
             h_enhanced = read_result['x_enhanced']
-            aux['read_gates'].append(read_result['read_gate'].detach())
+            aux['read_gate_sum'] += read_result['read_gate'].mean().detach().item()
+            aux['read_gate_count'] += 1
             
             # --- Step 2: COMPUTE ---
-            h_computed = self.compute(h_enhanced, cos_sin=cos_sin)
+            if self.use_checkpoint and self.training:
+                h_computed = checkpoint(
+                    self.compute, h_enhanced, cos_sin,
+                    use_reentrant=False
+                )
+            else:
+                h_computed = self.compute(h_enhanced, cos_sin=cos_sin)
             
             # --- Step 3: MEMORY WRITE ---
             # Only write first max_write_tokens for efficiency
@@ -283,9 +301,12 @@ class UnifiedMemoryLayer(nn.Module):
                 temperature=temperature,
                 hard=hard,
                 max_write_tokens=self.max_write_tokens,
+                iteration_idx=iteration,  # Current iteration within this layer
+                pass_idx=pass_idx,         # Current model-level pass
             )
             current_cache = write_result['updated_cache']
-            aux['write_gates'].append(write_result['write_gate'].detach())
+            aux['write_gate_sum'] += write_result['write_gate'].mean().detach().item()
+            aux['write_gate_count'] += 1
             
             # Update state - save for next iteration's thought injection
             h = h_computed
@@ -298,19 +319,36 @@ class UnifiedMemoryLayer(nn.Module):
             confidence_est = self.confidence_estimator
             if max_iterations > 1 and confidence_est is not None:
                 confidence = confidence_est(h)
-                aux['confidences'].append(confidence.detach())
+                conf_val = confidence.mean().detach().item()
+                aux['confidence_sum'] += conf_val
+                aux['confidence_count'] += 1
                 
-                # Early stopping if confident enough
-                if not self.training and confidence.mean() > confidence_threshold:
+                # Get learned halt threshold (budget + confidence aware)
+                # Threshold sees: h_pooled, confidence, iter_ratio, budget_remaining
+                # Low confidence + high budget → higher threshold (keep going)
+                # High confidence OR low budget → lower threshold (halt)
+                halt_threshold = confidence_est.get_layer_halt_threshold(
+                    h,
+                    confidence=confidence,  # No detach - allow gradient flow for learning
+                    current_iter=iteration,
+                    max_iter=max_iterations,
+                )
+                threshold_val = halt_threshold.mean().detach().item()
+                aux['halt_threshold'] = threshold_val  # Track for debugging
+                
+                # Early stopping if confident enough (using learned threshold)
+                if not self.training and conf_val > threshold_val:
                     break
         
-        # Aggregate auxiliary stats
-        if aux['read_gates']:
-            aux['avg_read_gate'] = torch.stack(aux['read_gates']).mean()
-        if aux['write_gates']:
-            aux['avg_write_gate'] = torch.stack(aux['write_gates']).mean()
-        if aux['iteration_feedback_gates']:
-            aux['avg_iteration_feedback_gate'] = torch.stack(aux['iteration_feedback_gates']).mean()
+        # Aggregate auxiliary stats (already scalars)
+        if aux['read_gate_count'] > 0:
+            aux['avg_read_gate'] = aux['read_gate_sum'] / aux['read_gate_count']
+        if aux['write_gate_count'] > 0:
+            aux['avg_write_gate'] = aux['write_gate_sum'] / aux['write_gate_count']
+        if aux['iteration_feedback_count'] > 0:
+            aux['avg_iteration_feedback_gate'] = aux['iteration_feedback_sum'] / aux['iteration_feedback_count']
+        if aux['confidence_count'] > 0:
+            aux['avg_confidence'] = aux['confidence_sum'] / aux['confidence_count']
         
         return h, current_cache, aux
 

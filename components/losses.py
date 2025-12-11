@@ -202,6 +202,273 @@ def compute_prediction_diversity_loss(logits: torch.Tensor, test_output: torch.T
     # Clamp to prevent explosion
     return kl_div.clamp(max=5.0)
 
+
+# ============================================================================
+# Confidence & Ponder-Based Losses
+# ============================================================================
+
+def compute_confidence_calibration_loss(
+    aux_info: Dict,
+    test_output: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    """
+    Confidence Calibration Loss - aligns confidence with actual correctness.
+    
+    The model's confidence should correlate with actual prediction accuracy.
+    If the model is 80% confident, it should be ~80% correct.
+    
+    This is crucial for:
+    1. Meaningful halt decisions (halt when actually correct, not just confident)
+    2. Trust calibration (confidence means something)
+    3. Better exploration (low confidence = need more passes)
+    
+    Loss: BCE(confidence, per_position_correctness)
+    """
+    device = test_output.device
+    
+    # Get final confidence
+    final_confidence = aux_info.get('final_confidence')
+    pass_logits = aux_info.get('pass_logits', [])
+    
+    if final_confidence is None or not pass_logits:
+        return torch.tensor(0.0, device=device)
+    
+    # Use final logits
+    final_logits = pass_logits[-1]  # [B, S, V]
+    
+    # Compute per-position correctness (ground truth for confidence)
+    valid_mask = (test_output != IGNORE_LABEL)  # [B, S]
+    predictions = final_logits.argmax(dim=-1)  # [B, S]
+    
+    # Correctness: 1 where correct, 0 where wrong
+    correct = ((predictions == test_output) & valid_mask).float()  # [B, S]
+    
+    # Confidence is [B, S] or [B] - need to handle both
+    if final_confidence.dim() == 1:
+        # Per-sample confidence: compare to sample-level correctness
+        sample_correct = correct.sum(dim=-1) / valid_mask.sum(dim=-1).clamp(min=1)  # [B]
+        loss = F.binary_cross_entropy(
+            final_confidence.clamp(0.01, 0.99),
+            sample_correct.detach(),
+            reduction='mean'
+        )
+    else:
+        # Per-position confidence
+        # Only compute loss on valid positions
+        if valid_mask.any():
+            conf_flat = final_confidence[valid_mask].clamp(0.01, 0.99)
+            correct_flat = correct[valid_mask].detach()
+            loss = F.binary_cross_entropy(conf_flat, correct_flat, reduction='mean')
+        else:
+            loss = torch.tensor(0.0, device=device)
+    
+    return loss
+
+
+def compute_confidence_monotonicity_loss(
+    aux_info: Dict,
+) -> torch.Tensor:
+    """
+    Confidence Monotonicity Loss - later passes should have higher/equal confidence.
+    
+    Intuition: As the model refines its answer, confidence should increase.
+    If confidence drops between passes, something is wrong (the model got worse).
+    
+    This regularizes the confidence estimator to produce sensible values and
+    encourages the model to actually improve with more computation.
+    
+    Loss: max(0, conf[i] - conf[i+1])^2 for each consecutive pair
+    """
+    pass_confidences = aux_info.get('pass_confidences', [])
+    
+    if len(pass_confidences) < 2:
+        return torch.tensor(0.0)
+    
+    device = pass_confidences[0].device
+    total_loss = torch.tensor(0.0, device=device)
+    
+    for i in range(len(pass_confidences) - 1):
+        conf_current = pass_confidences[i].mean()
+        conf_next = pass_confidences[i + 1].mean()
+        
+        # Penalize when confidence decreases (conf_current > conf_next)
+        violation = F.relu(conf_current - conf_next)
+        total_loss = total_loss + violation ** 2
+    
+    return total_loss / (len(pass_confidences) - 1)
+
+
+def compute_adaptive_ponder_cost(
+    aux_info: Dict,
+    test_output: torch.Tensor,
+    max_passes: int,
+) -> torch.Tensor:
+    """
+    Adaptive Ponder Cost - penalizes computation based on task difficulty.
+    
+    Unlike simple ponder_cost = passes/max_passes, this considers:
+    1. Confidence: High confidence but many passes = wasteful
+    2. Correctness: Wrong answer with many passes = very wasteful
+    3. Early correct: Reward halting early when already correct
+    
+    Key insight: The cost of computation should scale with redundancy.
+    - If confident after pass 1 but ran 3 passes: high cost
+    - If needed all passes to get confident: low cost
+    - If still wrong after all passes: some cost (tried hard)
+    
+    Loss formula:
+      ponder_cost = (passes_used / max) * (1 - difficulty_adjusted_need)
+    
+    Where difficulty_adjusted_need considers how confidence evolved.
+    """
+    device = test_output.device
+    
+    passes_run = aux_info.get('passes_run', 1)
+    pass_confidences = aux_info.get('pass_confidences', [])
+    pass_logits = aux_info.get('pass_logits', [])
+    
+    if not pass_confidences or not pass_logits:
+        # Fallback to simple ponder cost
+        return torch.tensor(passes_run / max_passes, device=device)
+    
+    # Base utilization
+    pass_utilization = passes_run / max_passes
+    
+    # Find first pass where confidence exceeded threshold
+    # This tells us "when could we have stopped"
+    threshold = 0.8  # Standard confidence threshold
+    first_confident_pass = passes_run  # Default: never confident
+    
+    for i, conf in enumerate(pass_confidences):
+        if conf.mean().item() > threshold:
+            first_confident_pass = i + 1
+            break
+    
+    # Redundant passes = passes after we were already confident
+    redundant_ratio = max(0, passes_run - first_confident_pass) / max_passes
+    
+    # Check if final answer is correct
+    if pass_logits:
+        final_logits = pass_logits[-1]
+        valid_mask = (test_output != IGNORE_LABEL)
+        predictions = final_logits.argmax(dim=-1)
+        correct = ((predictions == test_output) | ~valid_mask).all(dim=-1)  # [B]
+        correctness = correct.float().mean()
+    else:
+        correctness = torch.tensor(0.5, device=device)  # Unknown
+    
+    # Adaptive ponder cost:
+    # - High when: many redundant passes
+    # - Low when: needed all passes (never confident early)
+    # - Extra penalty when: wrong AND many passes (wasted compute)
+    
+    wrong_penalty = (1 - correctness) * 0.5  # Extra cost when wrong
+    
+    ponder_cost = pass_utilization * 0.3 + redundant_ratio * 0.5 + wrong_penalty * 0.2
+    
+    return ponder_cost.clamp(0, 1)
+
+
+def compute_halt_prediction_loss(
+    aux_info: Dict,
+    test_output: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Halt Prediction Loss (Q-learning style) - train halt decision to predict correctness.
+    
+    TRM uses a Q-head that predicts "should I halt?" with BCE against actual correctness.
+    We use our confidence as the halt signal, so we train confidence to predict correctness.
+    
+    This is similar to confidence calibration but focuses on the DECISION:
+    - If we halted (or would halt) at this pass, was it correct?
+    - Train halt threshold to say "halt" when answer is correct
+    
+    The key difference from calibration:
+    - Calibration: confidence ≈ correctness (soft matching)
+    - Halt prediction: halt_decision ≈ full_sequence_correct (binary task)
+    """
+    device = test_output.device
+    
+    pass_confidences = aux_info.get('pass_confidences', [])
+    pass_logits = aux_info.get('pass_logits', [])
+    
+    if not pass_confidences or not pass_logits:
+        return torch.tensor(0.0, device=device)
+    
+    total_loss = torch.tensor(0.0, device=device)
+    valid_mask = (test_output != IGNORE_LABEL)
+    
+    for i, (conf, logits) in enumerate(zip(pass_confidences, pass_logits)):
+        # Compute sequence-level correctness at this pass
+        predictions = logits.argmax(dim=-1)  # [B, S]
+        correct_positions = (predictions == test_output) | ~valid_mask  # [B, S]
+        seq_correct = correct_positions.all(dim=-1).float()  # [B] - 1 if all correct
+        
+        # Confidence should predict sequence correctness
+        # Use mean confidence as "would halt" decision
+        conf_mean = conf.mean(dim=-1) if conf.dim() > 1 else conf  # [B]
+        
+        # BCE loss: confidence should match correctness
+        loss = F.binary_cross_entropy(
+            conf_mean.clamp(0.01, 0.99),
+            seq_correct.detach(),
+            reduction='mean'
+        )
+        
+        # Weight later passes more (more important to get halt right at the end)
+        weight = (i + 1) / len(pass_confidences)
+        total_loss = total_loss + weight * loss
+    
+    return total_loss / len(pass_confidences)
+
+
+def compute_early_exit_bonus(
+    aux_info: Dict,
+    test_output: torch.Tensor,
+    max_passes: int,
+) -> torch.Tensor:
+    """
+    Early Exit Bonus - reward halting early when correct.
+    
+    This creates a direct incentive structure:
+    - Halt early + correct = REWARD (negative loss)
+    - Halt early + wrong = no reward
+    - Use all passes + correct = small reward
+    - Use all passes + wrong = no reward
+    
+    The bonus is: -bonus_scale * (1 - pass_utilization) * correctness
+    
+    This is NEGATIVE loss (reward) for efficient correct answers.
+    """
+    device = test_output.device
+    
+    passes_run = aux_info.get('passes_run', 1)
+    pass_logits = aux_info.get('pass_logits', [])
+    halted_early = aux_info.get('halted_early', False)
+    
+    if not pass_logits:
+        return torch.tensor(0.0, device=device)
+    
+    # Check final correctness
+    final_logits = pass_logits[-1]
+    valid_mask = (test_output != IGNORE_LABEL)
+    predictions = final_logits.argmax(dim=-1)
+    correct_positions = (predictions == test_output) | ~valid_mask
+    seq_correct = correct_positions.all(dim=-1).float()  # [B]
+    
+    # Savings from early halt
+    passes_saved = max_passes - passes_run
+    savings_ratio = passes_saved / max_passes
+    
+    # Bonus only if halted early AND correct
+    if halted_early:
+        bonus = -0.1 * savings_ratio * seq_correct.mean()  # Negative = reward
+    else:
+        bonus = torch.tensor(0.0, device=device)
+    
+    return bonus
+
 # TinyRecursiveModels convention: -100 means ignore this position in loss
 IGNORE_LABEL = -100
 
@@ -482,98 +749,159 @@ def compute_total_loss(
     device: torch.device
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    Aggregates all losses.
-    Returns total_loss and a dictionary of scalar loss components for logging.
+    Aggregates all losses including confidence-based and ponder losses.
     
-    Simplified for sequence format:
-    - logits: [B, S, vocab_size]
-    - test_output: [B, S] with IGNORE_LABEL for padding
+    Loss Components:
+    1. Task Loss: Cross-entropy with deep supervision
+    2. Confidence Calibration: Align confidence with actual correctness
+    3. Halt Prediction: Train halt decision via Q-learning style BCE
+    4. Confidence Monotonicity: Later passes should have higher confidence
+    5. Adaptive Ponder Cost: Penalize redundant computation
+    6. Early Exit Bonus: Reward efficient correct halting
+    7. Gate Regularization: Polarization + sparsity
+    8. Diversity Losses: Output entropy + prediction diversity
+    
+    Returns total_loss and metrics dict for logging.
     """
-    # 1. Task Loss
-    # Only use deep supervision if enabled (memory intensive)
     features = config.features
+    
+    # 1. Task Loss with deep supervision
     if features.use_deep_supervision:
         pass_logits_list = aux_info.get('pass_logits', [logits])
     else:
-        pass_logits_list = [logits]  # Only final output
+        pass_logits_list = [logits]
 
     task_loss = compute_task_loss(
         logits, test_output, pass_logits_list,
         model.vocab_size
     )
 
-    # 2. Q-Head Loss
+    # 2. Confidence Calibration Loss - confidence should match correctness
+    confidence_calibration_loss = compute_confidence_calibration_loss(
+        aux_info, test_output, model.vocab_size
+    )
+
+    # 3. Halt Prediction Loss (Q-learning style) - train halt to predict correctness
+    halt_prediction_loss = compute_halt_prediction_loss(aux_info, test_output)
+
+    # 4. Confidence Monotonicity Loss - confidence should increase across passes
+    confidence_monotonicity_loss = compute_confidence_monotonicity_loss(aux_info)
+
+    # 5. Adaptive Ponder Cost - penalize wasteful computation
+    adaptive_ponder_loss = compute_adaptive_ponder_cost(
+        aux_info, test_output, model.max_passes
+    )
+
+    # 6. Early Exit Bonus - reward efficient correct halts (negative loss = reward)
+    early_exit_bonus = compute_early_exit_bonus(
+        aux_info, test_output, model.max_passes
+    )
+
+    # 7. Legacy Q-Head Loss (for backward compatibility if q_halt/q_continue present)
     model_q_loss = compute_q_head_loss(aux_info, test_output, config, device)
 
-    # 3. Step Efficiency Loss
+    # 8. Step Efficiency Loss (layer-level)
     step_efficiency_loss = compute_step_efficiency_loss(
         logits, aux_info, test_output, config, model.num_layers, device
     )
 
-    # 4. Diversity Loss (always active, prevents slot collapse)
+    # 9. Diversity Loss (slot usage)
     diversity_loss = torch.tensor(0.0, device=device)
-    features = config.features
     if features.use_diversity_loss and 'slot_counts' in aux_info and aux_info['slot_counts']:
         diversity_loss = compute_diversity_loss(aux_info['slot_counts'])
 
-    # 5. Output Entropy Loss - prevents mode collapse and provides gradient to embeddings/output
+    # 10. Output Entropy Loss - prevents mode collapse
     output_entropy_loss = compute_output_entropy_loss(logits, test_output)
     
-    # 6. Prediction Diversity Loss - encourages diverse predictions matching target distribution
+    # 11. Prediction Diversity Loss
     pred_diversity_loss = compute_prediction_diversity_loss(logits, test_output, model.vocab_size)
 
-    # 7. Gate Polarization Loss - prevents gates from staying stuck at 0.5
+    # 12. Gate Regularization
     gate_polar_loss = torch.tensor(0.0, device=device)
+    gate_sparsity_loss = torch.tensor(0.0, device=device)
     read_gates = aux_info.get('read_gates', [])
     write_gates = aux_info.get('write_gates', [])
     if read_gates or write_gates:
         gate_polar_loss = compute_gate_polarization_loss(read_gates, write_gates)
-
-    # 8. Read/Write Gate Sparsity Loss - prevents gates from saturating to 1.0
-    gate_sparsity_loss = torch.tensor(0.0, device=device)
-    if read_gates or write_gates:
         gate_sparsity_loss = compute_read_gate_sparsity_loss(
             read_gates, write_gates,
-            read_target_ratio=0.4,  # 40% of reads should be open
-            write_target_ratio=0.3  # 30% of writes (more selective)
+            read_target_ratio=0.4,
+            write_target_ratio=0.3
         )
 
-    # Weighted Sum with NaN protection
-    # NOTE: Ponder loss removed - dual Q-head supersedes it
+    # === LOSS WEIGHTING ===
+    # Use config weights where available, sensible defaults otherwise
+    
+    # Confidence-based losses (new)
+    lambda_conf_calib = getattr(config, 'lambda_confidence_calibration', 0.5)
+    lambda_halt_pred = getattr(config, 'lambda_halt_prediction', 0.3)
+    lambda_conf_mono = getattr(config, 'lambda_confidence_monotonicity', 0.1)
+    lambda_ponder = getattr(features, 'lambda_ponder', 0.01)
+    
+    confidence_loss = (
+        lambda_conf_calib * confidence_calibration_loss +
+        lambda_halt_pred * halt_prediction_loss +
+        lambda_conf_mono * confidence_monotonicity_loss +
+        lambda_ponder * adaptive_ponder_loss +
+        early_exit_bonus  # Already scaled internally, can be negative
+    )
+    
+    # Compute efficiency losses
     compute_loss = (
         config.lambda_q_head * model_q_loss +
         config.lambda_step_efficiency * step_efficiency_loss
     )
     
-    # Gradient flow losses (help prevent vanishing gradients to embeddings/output)
-    # Reduced weights to prevent gradient explosion in deep recurrent networks
+    # Gradient flow losses
     gradient_flow_loss = output_entropy_loss + 0.05 * pred_diversity_loss
     
-    # Gate polarization: small weight to encourage decisive gates without dominating
-    # Sparsity loss: moderate weight to prevent gate saturation
+    # Gate regularization
     gate_loss = 0.01 * gate_polar_loss + 0.1 * gate_sparsity_loss
 
-    total_loss = task_loss + compute_loss + config.lambda_diversity * diversity_loss + gradient_flow_loss + gate_loss
+    # Total loss
+    total_loss = (
+        task_loss + 
+        confidence_loss +
+        compute_loss + 
+        config.lambda_diversity * diversity_loss + 
+        gradient_flow_loss + 
+        gate_loss
+    )
 
-    # NaN protection: if any component is NaN, use only task_loss
+    # NaN protection
     if torch.isnan(total_loss):
-        print(f"WARNING: NaN detected! task={task_loss.item():.4f}, q_head={model_q_loss.item():.4f}, "
-              f"step_eff={step_efficiency_loss.item():.4f}, diversity={diversity_loss.item():.4f}, "
-              f"entropy={output_entropy_loss.item():.4f}, pred_div={pred_diversity_loss.item():.4f}")
-        total_loss = task_loss  # Fallback to just task loss
+        print(f"WARNING: NaN detected in loss! Falling back to task_loss only.")
+        print(f"  task={task_loss.item():.4f}, conf_calib={confidence_calibration_loss:.4f}, "
+              f"halt_pred={halt_prediction_loss:.4f}, ponder={adaptive_ponder_loss:.4f}")
+        total_loss = task_loss
 
-    # Return metrics for logging
+    # Metrics for logging
     metrics = {
         'loss_total': total_loss.detach().item(),
         'loss_task': task_loss.detach().item(),
-        'loss_compute': compute_loss.detach().item() if isinstance(compute_loss, torch.Tensor) else compute_loss,
-        'loss_diversity': diversity_loss.detach().item() if isinstance(diversity_loss, torch.Tensor) else diversity_loss,
-        'loss_q_head': model_q_loss.detach().item() if isinstance(model_q_loss, torch.Tensor) else model_q_loss,
-        'loss_step_efficiency': step_efficiency_loss.detach().item() if isinstance(step_efficiency_loss, torch.Tensor) else step_efficiency_loss,
-        'loss_output_entropy': output_entropy_loss.detach().item() if isinstance(output_entropy_loss, torch.Tensor) else output_entropy_loss,
-        'loss_pred_diversity': pred_diversity_loss.detach().item() if isinstance(pred_diversity_loss, torch.Tensor) else pred_diversity_loss,
-        'loss_gate_polar': gate_polar_loss.detach().item() if isinstance(gate_polar_loss, torch.Tensor) else gate_polar_loss,
-        'loss_gate_sparsity': gate_sparsity_loss.detach().item() if isinstance(gate_sparsity_loss, torch.Tensor) else gate_sparsity_loss,
+        # Confidence-based metrics
+        'loss_confidence_calibration': _to_scalar(confidence_calibration_loss),
+        'loss_halt_prediction': _to_scalar(halt_prediction_loss),
+        'loss_confidence_monotonicity': _to_scalar(confidence_monotonicity_loss),
+        'loss_ponder_adaptive': _to_scalar(adaptive_ponder_loss),
+        'loss_early_exit_bonus': _to_scalar(early_exit_bonus),
+        # Compute efficiency metrics
+        'loss_compute': _to_scalar(compute_loss),
+        'loss_q_head': _to_scalar(model_q_loss),
+        'loss_step_efficiency': _to_scalar(step_efficiency_loss),
+        # Regularization metrics
+        'loss_diversity': _to_scalar(diversity_loss),
+        'loss_output_entropy': _to_scalar(output_entropy_loss),
+        'loss_pred_diversity': _to_scalar(pred_diversity_loss),
+        'loss_gate_polar': _to_scalar(gate_polar_loss),
+        'loss_gate_sparsity': _to_scalar(gate_sparsity_loss),
     }
 
     return total_loss, metrics
+
+
+def _to_scalar(x) -> float:
+    """Convert tensor or scalar to float for logging."""
+    if isinstance(x, torch.Tensor):
+        return x.detach().item()
+    return float(x)

@@ -100,7 +100,13 @@ class RecursiveRefinementModel(nn.Module):
         # Segment embedding: context=0 (demos + test_input), answer=1 (test_output)
         self.segment_embed = nn.Embedding(2, d_model)
 
-        # Learned slot embeddings (concept anchors)
+        # === Slot Metadata Dimensions (must match MemoryController) ===
+        # Metadata: confidence (1) + layer_embed (8) + iter_embed (4) + pass_embed (4) = 17
+        self.d_meta = 17
+        self.d_slot = d_cache + self.d_meta  # Total slot dimension
+
+        # Learned slot embeddings (concept anchors) - content only
+        # Metadata (confidence + temporal) is initialized to zero
         self.slot_embeddings = nn.Parameter(
             torch.randn(num_layers, num_slots, d_cache) * 0.02
         )
@@ -111,9 +117,12 @@ class RecursiveRefinementModel(nn.Module):
         )
 
         # Shared confidence estimator (created BEFORE layers so it can be shared)
+        # Now includes learned halt thresholds (budget-aware)
         self.confidence_estimator = ConfidenceEstimator(
             d_model=d_model,
             vocab_size=vocab_size,
+            max_iterations=max_internal_iterations,
+            max_passes=max_passes,
         )
 
         # Unified Memory Layers (imported from unified_layer.py)
@@ -128,6 +137,7 @@ class RecursiveRefinementModel(nn.Module):
                 dropout=dropout,
                 max_write_tokens=64,
                 use_linear_attention=True,
+                use_checkpoint=(max_seq_len > 500),  # Enable for large sequences
             )
             for i in range(num_layers)
         ])
@@ -168,9 +178,23 @@ class RecursiveRefinementModel(nn.Module):
         nn.init.zeros_(self.answer_feedback_gate.bias)
 
     def get_initial_cache(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        """Initialize cache with learned slot embeddings."""
-        cache = self.slot_embeddings.view(self.total_slots, self.d_cache)
-        return cache.unsqueeze(0).expand(batch_size, -1, -1).clone()
+        """Initialize cache with learned slot embeddings + zero metadata.
+        
+        Cache structure: [content (d_cache) | confidence (1) | temporal (16)]
+        - Content: learned slot embeddings
+        - Confidence: 0 (empty slots have no confidence)
+        - Temporal: 0 (not yet written)
+        """
+        # Content from learned embeddings
+        content = self.slot_embeddings.view(self.total_slots, self.d_cache)  # [L*K, D_cache]
+        content = content.unsqueeze(0).expand(batch_size, -1, -1).clone()   # [B, L*K, D_cache]
+        
+        # Zero metadata (confidence=0, temporal=0)
+        metadata = torch.zeros(batch_size, self.total_slots, self.d_meta, device=device)
+        
+        # Combine into full cache
+        cache = torch.cat([content, metadata], dim=-1)  # [B, L*K, D_slot]
+        return cache
 
     def embed_sequence(self, seq: torch.Tensor, is_answer: bool = False) -> torch.Tensor:
         """Embed sequence with segment information."""
@@ -254,24 +278,31 @@ class RecursiveRefinementModel(nn.Module):
         # Initialize cache
         cache = self.get_initial_cache(B, device)
 
-        # Track auxiliary information
+        # Track auxiliary information - use scalars to save memory
         aux = {
             # Model-level stats
             'passes_run': 0,
             'max_passes': self.max_passes,
-            'pass_confidences': [],
-            'answer_feedback_gates': [],  # Model-level feedback gating
+            'pass_confidences': [],  # Keep as list (small: just max_passes items)
+            'pass_logits': [],       # For deep supervision: logits at each pass
+            'answer_feedback_sum': 0.0,
+            'answer_feedback_count': 0,
             
-            # Layer-level stats (aggregated across all passes)
-            'layer_iterations': [],
-            'iteration_feedback_gates': [],  # Layer-level thought injection
-            'confidences': [],
-            'read_gates': [],
-            'write_gates': [],
+            # Layer-level stats (aggregated as scalars)
+            'layer_iterations': [],  # Keep as list (small: passes * layers items)
+            'total_layer_steps': 0,
+            'confidence_sum': 0.0,
+            'confidence_count': 0,
+            'read_gate_sum': 0.0,
+            'read_gate_count': 0,
+            'write_gate_sum': 0.0,
+            'write_gate_count': 0,
+            'iteration_feedback_sum': 0.0,
+            'iteration_feedback_count': 0,
             
             # Compute tracking
-            'total_layer_steps': 0,
             'temperature': temperature,
+            'halted_early': False,   # Track if we halted before max_passes
         } if return_aux else {}
 
         # Current sequence for input to the model
@@ -307,11 +338,19 @@ class RecursiveRefinementModel(nn.Module):
                 
                 # Track answer feedback gate values
                 if return_aux:
-                    aux['answer_feedback_gates'].append(gate.mean().detach())
+                    aux['answer_feedback_sum'] += gate.mean().detach().item()
+                    aux['answer_feedback_count'] += 1
                 
-                # Clone and update current_seq
-                current_seq = current_seq.clone()
-                current_seq[:, test_start_idx:test_start_idx + S] = updated_test_region
+                # Rebuild current_seq with updated test region (no in-place ops)
+                # This avoids the autograd issue with slice assignment
+                current_seq = torch.cat([
+                    current_seq[:, :test_start_idx],
+                    updated_test_region,
+                    current_seq[:, test_start_idx + S:]
+                ], dim=1) if test_start_idx + S < current_seq.shape[1] else torch.cat([
+                    current_seq[:, :test_start_idx],
+                    updated_test_region
+                ], dim=1)
 
             # Process through recursive layers WITHIN the current pass
             h = current_seq
@@ -324,22 +363,31 @@ class RecursiveRefinementModel(nn.Module):
                     hard=hard,
                     max_iterations=max_iterations,
                     confidence_threshold=self.confidence_threshold,
+                    pass_idx=pass_idx,  # Pass temporal index for slot metadata
                 )
 
                 if return_aux and layer_aux:
                     iters_run = layer_aux.get('iterations_run', 1)
                     aux['layer_iterations'].append(iters_run)
                     aux['total_layer_steps'] += iters_run
-                    aux['confidences'].extend(layer_aux.get('confidences', []))
-                    aux['read_gates'].extend(layer_aux.get('read_gates', []))
-                    aux['write_gates'].extend(layer_aux.get('write_gates', []))
-                    # Track layer-level thought injection gates
-                    if 'iteration_feedback_gates' in layer_aux:
-                        aux['iteration_feedback_gates'].extend(layer_aux['iteration_feedback_gates'])
+                    
+                    # Aggregate scalar stats from layer
+                    aux['confidence_sum'] += layer_aux.get('confidence_sum', 0.0)
+                    aux['confidence_count'] += layer_aux.get('confidence_count', 0)
+                    aux['read_gate_sum'] += layer_aux.get('read_gate_sum', 0.0)
+                    aux['read_gate_count'] += layer_aux.get('read_gate_count', 0)
+                    aux['write_gate_sum'] += layer_aux.get('write_gate_sum', 0.0)
+                    aux['write_gate_count'] += layer_aux.get('write_gate_count', 0)
+                    aux['iteration_feedback_sum'] += layer_aux.get('iteration_feedback_sum', 0.0)
+                    aux['iteration_feedback_count'] += layer_aux.get('iteration_feedback_count', 0)
 
             # Extract logits for test output positions
             test_logits = self.output_proj(h[:, test_start_idx:test_start_idx + S])  # [B, S, vocab_size]
             final_logits = test_logits
+            
+            # Store logits for deep supervision (if enabled)
+            if return_aux and features.use_deep_supervision:
+                aux['pass_logits'].append(test_logits)
 
             # Confidence assessment for model-level halting
             if return_aux:
@@ -353,9 +401,36 @@ class RecursiveRefinementModel(nn.Module):
                 )
                 aux['pass_confidences'].append(current_confidence.detach())
 
-                # Check if we should stop based on confidence
-                if not self.training and current_confidence.mean() > self.confidence_threshold:
-                    break
+                # Get learned halt threshold (budget + confidence aware)
+                # Threshold sees: h_pooled, confidence, pass_ratio, budget_remaining
+                # Low confidence + high budget → higher threshold (keep going)
+                # High confidence OR low budget → lower threshold (halt)
+                halt_threshold = self.confidence_estimator.get_model_halt_threshold(
+                    h_test_region,
+                    confidence=current_confidence,  # No detach - allow gradient flow for learning
+                    current_pass=pass_idx,
+                    max_pass=self.max_passes,
+                )
+                threshold_val = halt_threshold.mean().detach().item()
+                aux['model_halt_threshold'] = threshold_val  # Track for debugging
+
+                # === HALTING DECISION ===
+                # Check if confident enough to halt
+                should_halt = current_confidence.mean() > threshold_val
+                
+                if should_halt:
+                    if self.training:
+                        # During training: ε-greedy exploration
+                        # With prob ε, ignore confidence and continue anyway
+                        explore = torch.rand(1, device=device).item() < features.halt_exploration_prob
+                        if not explore:
+                            aux['halted_early'] = True
+                            break  # Halt: confident and not exploring
+                        # else: continue despite confidence (exploration)
+                    else:
+                        # During inference: always respect confidence
+                        aux['halted_early'] = True
+                        break
 
             # Store for next pass (before any break)
             prev_logits = test_logits.detach()
@@ -368,5 +443,11 @@ class RecursiveRefinementModel(nn.Module):
                 logits=final_logits,
             )
             aux['final_confidence'] = final_confidence
+            
+            # Compute ponder cost: penalize using more passes
+            # Normalized by max_passes so cost is in [0, 1]
+            if features.use_ponder_cost:
+                passes_used = aux['passes_run']
+                aux['ponder_cost'] = passes_used / self.max_passes
 
         return final_logits, cache, aux
