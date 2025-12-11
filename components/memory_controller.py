@@ -407,6 +407,7 @@ class MemoryController(nn.Module):
             'x_enhanced': x_enhanced,
             'context': context,
             'read_gate': read_gate,
+            'read_threshold': read_thresh,  # Include threshold tensor for gradient flow
             'attn_weights': attn_weights,
         }
 
@@ -549,6 +550,7 @@ class MemoryController(nn.Module):
         return {
             'updated_cache': updated_cache,
             'write_gate': write_gate,
+            'write_threshold': write_thresh,  # Include threshold tensor for gradient flow
             'write_decision': soft_decision,  # For debugging/analysis
             'importance': importance,
             'slot_probs': slot_probs,

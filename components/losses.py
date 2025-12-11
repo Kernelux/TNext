@@ -469,6 +469,125 @@ def compute_early_exit_bonus(
     
     return bonus
 
+
+def compute_threshold_supervision_loss(
+    model,
+    aux_info: Dict,
+    test_output: torch.Tensor,
+    config: 'TrainingConfig',
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Threshold Supervision Loss - provides gradients to learned threshold networks.
+    
+    Supervises both:
+    1. Model halt thresholds: should be LOW when answer is correct, HIGH when wrong
+    2. Layer halt thresholds: similar logic based on layer-level improvement
+    
+    This is a SOFT target loss:
+    - When correct: threshold should approach confidence (allow halting)
+    - When wrong: threshold should be high (prevent premature halting)
+    """
+    total_loss = torch.tensor(0.0, device=device)
+    num_terms = 0
+    
+    # === Model-Level Threshold Supervision ===
+    pass_logits = aux_info.get('pass_logits', [])
+    pass_confidences = aux_info.get('pass_confidences', [])
+    model_halt_thresholds = aux_info.get('model_halt_thresholds', [])
+    
+    if pass_logits and pass_confidences and model_halt_thresholds:
+        valid_mask = (test_output != IGNORE_LABEL)
+        
+        for pass_idx, (logits, confidence, halt_thresh) in enumerate(
+            zip(pass_logits, pass_confidences, model_halt_thresholds)
+        ):
+            # Compute correctness at this pass
+            predictions = logits.argmax(dim=-1)  # [B, S]
+            correct_positions = (predictions == test_output) | ~valid_mask  # [B, S]
+            seq_correct = correct_positions.all(dim=-1).float()  # [B]
+            
+            # Get confidence mean
+            conf_mean = confidence.mean(dim=-1) if confidence.dim() > 1 else confidence  # [B]
+            
+            # Target threshold based on correctness
+            margin = 0.1
+            target_thresh = torch.where(
+                seq_correct > 0.5,
+                conf_mean - margin,  # Correct: threshold below confidence → halt allowed
+                conf_mean + margin,  # Wrong: threshold above confidence → no halt
+            ).clamp(0.1, 0.9).detach()
+            
+            # MSE loss
+            loss = F.mse_loss(halt_thresh.clamp(0.1, 0.9), target_thresh)
+            total_loss = total_loss + loss
+            num_terms += 1
+    
+    # === Layer-Level Threshold Supervision ===
+    layer_halt_thresholds = aux_info.get('layer_halt_thresholds', [])
+    layer_confidences = aux_info.get('layer_confidences', [])
+    
+    if layer_halt_thresholds and layer_confidences:
+        # For layer thresholds, we use a simpler heuristic:
+        # Threshold should be slightly below confidence (allow halting when confident)
+        # We don't have per-layer correctness, so use weak supervision
+        for halt_thresh, confidence in zip(layer_halt_thresholds, layer_confidences):
+            if halt_thresh is None or confidence is None:
+                continue
+            
+            conf_mean = confidence.mean(dim=-1) if confidence.dim() > 1 else confidence  # [B]
+            
+            # Target: threshold slightly below confidence (allow halting)
+            # This encourages the model to halt when it becomes confident
+            target_thresh = (conf_mean - 0.05).clamp(0.1, 0.9).detach()
+            
+            loss = F.mse_loss(halt_thresh.clamp(0.1, 0.9), target_thresh)
+            total_loss = total_loss + 0.5 * loss  # Lower weight for layer-level
+            num_terms += 1
+    
+    if num_terms > 0:
+        total_loss = total_loss / num_terms
+    
+    return total_loss
+
+
+def compute_memory_threshold_regularization(
+    model,
+    aux_info: Dict,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Memory Threshold Regularization - provides gradients to read/write threshold networks.
+    
+    Unlike halt thresholds (which have clear targets), read/write thresholds
+    control memory access patterns. We provide weak supervision:
+    
+    1. Thresholds should be around 0.5 initially (not too restrictive/permissive)
+    2. As training progresses, let them move based on gate correlation
+    
+    The loss is:
+    - Weak prior toward 0.5 (regularization)
+    - Correlation with gate values (threshold should track gate difficulty)
+    """
+    read_thresholds = aux_info.get('read_thresholds', [])
+    write_thresholds = aux_info.get('write_thresholds', [])
+    
+    total_loss = torch.tensor(0.0, device=device)
+    
+    # Weak prior: thresholds near 0.5 initially
+    # This provides gradient signal while letting them adapt
+    for thresh in read_thresholds:
+        if thresh is not None and isinstance(thresh, torch.Tensor) and thresh.requires_grad:
+            # Encourage threshold near 0.5 (weak regularization)
+            total_loss = total_loss + 0.1 * ((thresh - 0.5) ** 2).mean()
+    
+    for thresh in write_thresholds:
+        if thresh is not None and isinstance(thresh, torch.Tensor) and thresh.requires_grad:
+            # Encourage threshold near 0.5 (weak regularization)  
+            total_loss = total_loss + 0.1 * ((thresh - 0.5) ** 2).mean()
+    
+    return total_loss
+
 # TinyRecursiveModels convention: -100 means ignore this position in loss
 IGNORE_LABEL = -100
 
@@ -797,7 +916,17 @@ def compute_total_loss(
         aux_info, test_output, model.max_passes
     )
 
-    # 7. Legacy Q-Head Loss (for backward compatibility if q_halt/q_continue present)
+    # 7. Threshold Supervision Loss - provides gradients to halt threshold networks
+    threshold_supervision_loss = compute_threshold_supervision_loss(
+        model, aux_info, test_output, config, device
+    )
+    
+    # 7b. Memory Threshold Regularization - provides gradients to read/write thresholds
+    memory_threshold_loss = compute_memory_threshold_regularization(
+        model, aux_info, device
+    )
+
+    # 8. Legacy Q-Head Loss (for backward compatibility if q_halt/q_continue present)
     model_q_loss = compute_q_head_loss(aux_info, test_output, config, device)
 
     # 8. Step Efficiency Loss (layer-level)
@@ -836,12 +965,15 @@ def compute_total_loss(
     lambda_conf_calib = getattr(config, 'lambda_confidence_calibration', 0.5)
     lambda_halt_pred = getattr(config, 'lambda_halt_prediction', 0.3)
     lambda_conf_mono = getattr(config, 'lambda_confidence_monotonicity', 0.1)
+    lambda_threshold = getattr(config, 'lambda_threshold_supervision', 0.2)
     lambda_ponder = getattr(features, 'lambda_ponder', 0.01)
     
     confidence_loss = (
         lambda_conf_calib * confidence_calibration_loss +
         lambda_halt_pred * halt_prediction_loss +
         lambda_conf_mono * confidence_monotonicity_loss +
+        lambda_threshold * threshold_supervision_loss +
+        lambda_threshold * memory_threshold_loss +  # Same weight for memory thresholds
         lambda_ponder * adaptive_ponder_loss +
         early_exit_bonus  # Already scaled internally, can be negative
     )
@@ -883,6 +1015,8 @@ def compute_total_loss(
         'loss_confidence_calibration': _to_scalar(confidence_calibration_loss),
         'loss_halt_prediction': _to_scalar(halt_prediction_loss),
         'loss_confidence_monotonicity': _to_scalar(confidence_monotonicity_loss),
+        'loss_threshold_supervision': _to_scalar(threshold_supervision_loss),
+        'loss_memory_threshold': _to_scalar(memory_threshold_loss),
         'loss_ponder_adaptive': _to_scalar(adaptive_ponder_loss),
         'loss_early_exit_bonus': _to_scalar(early_exit_bonus),
         # Compute efficiency metrics

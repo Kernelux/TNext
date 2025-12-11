@@ -112,8 +112,10 @@ class RecursiveRefinementModel(nn.Module):
         )
 
         # Layer-ID embeddings for representational separation
+        # Used in initial cache to give each layer's slots a distinct identity
+        # Dimension matches d_layer_embed in MemoryController (8)
         self.layer_id_embeddings = nn.Parameter(
-            torch.randn(num_layers, d_cache // 4) * 0.02
+            torch.randn(num_layers, 8) * 0.02  # 8 = d_layer_embed
         )
 
         # Shared confidence estimator (created BEFORE layers so it can be shared)
@@ -178,19 +180,39 @@ class RecursiveRefinementModel(nn.Module):
         nn.init.zeros_(self.answer_feedback_gate.bias)
 
     def get_initial_cache(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        """Initialize cache with learned slot embeddings + zero metadata.
+        """Initialize cache with learned slot embeddings + layer identity metadata.
         
         Cache structure: [content (d_cache) | confidence (1) | temporal (16)]
         - Content: learned slot embeddings
         - Confidence: 0 (empty slots have no confidence)
-        - Temporal: 0 (not yet written)
+        - Temporal: [layer_id (8) | iter (4) | pass (4)]
+          - layer_id: Learned layer identity embedding (gives gradient flow!)
+          - iter: 0 (not yet written by any iteration)
+          - pass: 0 (not yet written by any pass)
         """
         # Content from learned embeddings
         content = self.slot_embeddings.view(self.total_slots, self.d_cache)  # [L*K, D_cache]
         content = content.unsqueeze(0).expand(batch_size, -1, -1).clone()   # [B, L*K, D_cache]
         
-        # Zero metadata (confidence=0, temporal=0)
-        metadata = torch.zeros(batch_size, self.total_slots, self.d_meta, device=device)
+        # Confidence: 0 for empty slots
+        confidence = torch.zeros(batch_size, self.total_slots, 1, device=device)
+        
+        # Layer identity embedding: each layer's slots get that layer's embedding
+        # This provides gradient flow to layer_id_embeddings!
+        # Shape: [num_layers, 8] -> expand to [num_layers, num_slots, 8] -> [L*K, 8]
+        layer_ids = self.layer_id_embeddings.unsqueeze(1).expand(
+            -1, self.num_slots, -1
+        ).reshape(self.total_slots, 8)  # [L*K, 8]
+        layer_ids = layer_ids.unsqueeze(0).expand(batch_size, -1, -1)  # [B, L*K, 8]
+        
+        # Iteration and pass embeddings: 0 (not yet written)
+        iter_pass = torch.zeros(batch_size, self.total_slots, 8, device=device)  # 4 + 4 = 8
+        
+        # Combine temporal metadata: [layer_id (8) | iter (4) | pass (4)]
+        temporal = torch.cat([layer_ids, iter_pass], dim=-1)  # [B, L*K, 16]
+        
+        # Full metadata: [confidence (1) | temporal (16)]
+        metadata = torch.cat([confidence, temporal], dim=-1)  # [B, L*K, 17]
         
         # Combine into full cache
         cache = torch.cat([content, metadata], dim=-1)  # [B, L*K, D_slot]
@@ -311,7 +333,9 @@ class RecursiveRefinementModel(nn.Module):
         final_logits = None
 
         # === MODEL-LEVEL RECURSIVE REFINEMENT LOOP ===
-        for pass_idx in range(self.max_passes):
+        # Use config.max_passes if provided (for debug scenarios), else model default
+        effective_max_passes = min(config.max_passes, self.max_passes) if config.max_passes else self.max_passes
+        for pass_idx in range(effective_max_passes):
             if return_aux:
                 aux['passes_run'] = pass_idx + 1
 
@@ -355,7 +379,11 @@ class RecursiveRefinementModel(nn.Module):
             # Process through recursive layers WITHIN the current pass
             h = current_seq
             for layer_idx, layer in enumerate(self.layers):
-                max_iterations = self.max_internal_iterations if features.use_layer_act else 1
+                # Use config.max_recurrent_steps if provided, else model default
+                if features.use_layer_act:
+                    max_iterations = min(config.max_recurrent_steps, self.max_internal_iterations) if config.max_recurrent_steps else self.max_internal_iterations
+                else:
+                    max_iterations = 1
                 h, cache, layer_aux = layer(
                     h, cache,
                     cos_sin=cos_sin_full,
@@ -380,6 +408,20 @@ class RecursiveRefinementModel(nn.Module):
                     aux['write_gate_count'] += layer_aux.get('write_gate_count', 0)
                     aux['iteration_feedback_sum'] += layer_aux.get('iteration_feedback_sum', 0.0)
                     aux['iteration_feedback_count'] += layer_aux.get('iteration_feedback_count', 0)
+                    
+                    # Aggregate threshold tensors (for gradient flow)
+                    if 'read_thresholds' not in aux:
+                        aux['read_thresholds'] = []
+                    if 'write_thresholds' not in aux:
+                        aux['write_thresholds'] = []
+                    if 'layer_halt_thresholds' not in aux:
+                        aux['layer_halt_thresholds'] = []
+                    if 'layer_confidences' not in aux:
+                        aux['layer_confidences'] = []
+                    aux['read_thresholds'].extend(layer_aux.get('read_thresholds', []))
+                    aux['write_thresholds'].extend(layer_aux.get('write_thresholds', []))
+                    aux['layer_halt_thresholds'].extend(layer_aux.get('layer_halt_thresholds', []))
+                    aux['layer_confidences'].extend(layer_aux.get('layer_confidences', []))
 
             # Extract logits for test output positions
             test_logits = self.output_proj(h[:, test_start_idx:test_start_idx + S])  # [B, S, vocab_size]
@@ -412,7 +454,13 @@ class RecursiveRefinementModel(nn.Module):
                     max_pass=self.max_passes,
                 )
                 threshold_val = halt_threshold.mean().detach().item()
-                aux['model_halt_threshold'] = threshold_val  # Track for debugging
+                aux['model_halt_threshold'] = threshold_val  # Scalar for debugging
+                
+                # Store threshold TENSOR (with gradients) for loss computation
+                # This allows threshold network to receive supervision
+                if 'model_halt_thresholds' not in aux:
+                    aux['model_halt_thresholds'] = []
+                aux['model_halt_thresholds'].append(halt_threshold)  # [B] with gradients
 
                 # === HALTING DECISION ===
                 # Check if confident enough to halt

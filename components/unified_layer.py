@@ -40,7 +40,7 @@ from contextlib import nullcontext
 from torch.utils.checkpoint import checkpoint
 
 from .memory_controller import MemoryController, ConfidenceEstimator
-from .modules import LinearAttention, CosSin
+from .modules import LinearAttention, CosSin, CacheSelfAttention
 
 
 class ComputeBlock(nn.Module):
@@ -197,6 +197,35 @@ class UnifiedMemoryLayer(nn.Module):
         # Optional: Confidence estimator for recursive refinement
         # (Can be shared across layers or per-layer)
         self.confidence_estimator = None  # Set externally if needed
+        
+        # === Cache Self-Attention (Memory Consolidation) ===
+        # After each write, allow cache slots to attend to each other.
+        # This enables:
+        # 1. Integration of new info with existing knowledge
+        # 2. Transitive reasoning (A→B, B→C ⟹ A→C)
+        # 3. Deduplication and consolidation
+        # 
+        # Operates on FULL SLOT (content + metadata) so that:
+        # - Confidence scores influence attention weights
+        # - Layer ID enables cross-layer slot reasoning
+        # - Temporal info (iter/pass) provides recency context
+        d_meta = 17  # Must match MemoryController: confidence(1) + temporal(16)
+        d_slot = d_cache + d_meta
+        
+        # Find largest valid num_heads that divides d_slot evenly
+        # d_slot = 65 (48 + 17), so we need a divisor of 65: 1, 5, 13, 65
+        cache_attn_heads = 1  # Default to single head
+        for h in [5, 13]:  # Try common divisors (65 = 5 * 13)
+            if d_slot % h == 0:
+                cache_attn_heads = h
+                break
+        
+        self.cache_self_attn = CacheSelfAttention(
+            d_cache=d_slot,  # Full slot dimension, not just content
+            num_heads=cache_attn_heads,
+            dropout=dropout,
+            use_linear=True,  # Linear attention for efficiency
+        )
     
     def forward(
         self,
@@ -285,6 +314,11 @@ class UnifiedMemoryLayer(nn.Module):
             aux['read_gate_sum'] += read_result['read_gate'].mean().detach().item()
             aux['read_gate_count'] += 1
             
+            # Store read threshold tensor (for gradient flow to threshold network)
+            if 'read_thresholds' not in aux:
+                aux['read_thresholds'] = []
+            aux['read_thresholds'].append(read_result.get('read_threshold'))
+            
             # --- Step 2: COMPUTE ---
             if self.use_checkpoint and self.training:
                 h_computed = checkpoint(
@@ -307,6 +341,22 @@ class UnifiedMemoryLayer(nn.Module):
             current_cache = write_result['updated_cache']
             aux['write_gate_sum'] += write_result['write_gate'].mean().detach().item()
             aux['write_gate_count'] += 1
+            
+            # Store write threshold tensor (for gradient flow to threshold network)
+            if 'write_thresholds' not in aux:
+                aux['write_thresholds'] = []
+            aux['write_thresholds'].append(write_result.get('write_threshold'))
+            
+            # --- Step 3b: CACHE CONSOLIDATION (Self-Attention) ---
+            # After writing, let cache slots attend to each other to:
+            # 1. Integrate new info with existing knowledge
+            # 2. Enable transitive reasoning across slots
+            # 3. Consolidate and deduplicate information
+            # 
+            # Operates on FULL SLOT (content + metadata) so that attention
+            # can leverage confidence, layer_id, and temporal information
+            # when deciding how slots should influence each other.
+            current_cache = self.cache_self_attn(current_cache)
             
             # Update state - save for next iteration's thought injection
             h = h_computed
@@ -334,10 +384,22 @@ class UnifiedMemoryLayer(nn.Module):
                     max_iter=max_iterations,
                 )
                 threshold_val = halt_threshold.mean().detach().item()
-                aux['halt_threshold'] = threshold_val  # Track for debugging
+                aux['halt_threshold'] = threshold_val  # Scalar for debugging
+                
+                # Store threshold TENSOR (with gradients) for loss computation
+                if 'layer_halt_thresholds' not in aux:
+                    aux['layer_halt_thresholds'] = []
+                aux['layer_halt_thresholds'].append(halt_threshold)  # [B] with gradients
+                
+                # Also store confidence tensor for layer-level threshold supervision
+                if 'layer_confidences' not in aux:
+                    aux['layer_confidences'] = []
+                aux['layer_confidences'].append(confidence.detach())
                 
                 # Early stopping if confident enough (using learned threshold)
-                if not self.training and conf_val > threshold_val:
+                # During inference: always respect confidence
+                # During training: still allow halting (gradient flows through halt_threshold)
+                if conf_val > threshold_val:
                     break
         
         # Aggregate auxiliary stats (already scalars)
