@@ -75,7 +75,7 @@ class FeatureFlags:
     use_deep_supervision: bool = False   # Train on every pass (memory intensive - disabled by default)
     use_answer_feedback: bool = True     # Feed previous pass's answer back (TRM's key insight)
     no_act_continue: bool = True         # TRM: Skip Q_continue loss (paper recommends True)
-    use_refinement_read: bool = True     # TRM: Answer reads from cache before output
+    # NOTE: use_refinement_read removed - refinement happens through multi-pass mechanism
     use_gradient_free_passes: bool = False  # With AdamAtan2, train all passes (no gradient explosion)
     # NOTE: Set to True if you run out of memory on multi-pass training
 
@@ -112,7 +112,7 @@ class FeatureFlags:
         if self.use_deep_supervision: trm.append("deep-sup")
         if self.use_answer_feedback: trm.append("ans-fb")
         if self.no_act_continue: trm.append("no-q-cont")  # Paper recommends this
-        if self.use_refinement_read: trm.append("refine")
+        # refinement_read removed
         if self.use_gradient_free_passes: trm.append("no-grad")
 
         return (f"Core: [{', '.join(core)}] | "

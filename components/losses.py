@@ -50,6 +50,61 @@ def compute_gate_polarization_loss(
     return polar_loss.mean()
 
 
+def compute_read_gate_sparsity_loss(
+    read_gates: List[torch.Tensor],
+    write_gates: List[torch.Tensor],
+    read_target_ratio: float = 0.4,
+    write_target_ratio: float = 0.3,
+) -> torch.Tensor:
+    """
+    Gate Sparsity Loss - prevents read/write gates from saturating to 1.0.
+    
+    Without this, the model finds shortcuts:
+    - Read gates all → 1: always read from cache (bypasses selective memory)
+    - Write gates all → 1: always overwrite cache (destroys learned patterns)
+    
+    The loss penalizes deviation from target activation ratios:
+    L = (read_ratio - read_target)^2 + (write_ratio - write_target)^2
+    
+    Args:
+        read_gates: List of read gate tensors from each layer/pass
+        write_gates: List of write gate tensors from each layer/pass
+        read_target_ratio: Target fraction of read gates open (default 0.4 = 40%)
+        write_target_ratio: Target fraction of write gates open (default 0.3 = 30%)
+                           Lower than read because writes should be more selective
+    
+    Returns:
+        Scalar loss penalizing deviation from target activation ratios
+    """
+    total_loss = torch.tensor(0.0)
+    
+    # Read gate sparsity
+    if read_gates:
+        all_read_gates = []
+        for g in read_gates:
+            if g is not None and g.numel() > 0:
+                all_read_gates.append(g.view(-1))
+        
+        if all_read_gates:
+            gates = torch.cat(all_read_gates)
+            actual_ratio = gates.mean()
+            total_loss = total_loss + (actual_ratio - read_target_ratio) ** 2
+    
+    # Write gate sparsity (more selective - lower target)
+    if write_gates:
+        all_write_gates = []
+        for g in write_gates:
+            if g is not None and g.numel() > 0:
+                all_write_gates.append(g.view(-1))
+        
+        if all_write_gates:
+            gates = torch.cat(all_write_gates)
+            actual_ratio = gates.mean()
+            total_loss = total_loss + (actual_ratio - write_target_ratio) ** 2
+    
+    return total_loss
+
+
 def compute_diversity_loss(slot_counts_list: list) -> torch.Tensor:
     """
     Slot Diversity Loss (Section 9.3 - Solution A):
@@ -232,76 +287,102 @@ def compute_q_head_loss(
     """
     Q-Head Loss (TRM-style Adaptive Computation Time).
     
-    Trains the dual Q-head to predict correctness for halting:
-    - q_halt: BCE(q_halt, is_correct) - learns to say "stop, this is right"
-    - q_continue: BCE(q_continue, is_wrong) - learns to say "continue, this is wrong"
-                  (optional, controlled by no_act_continue flag)
+    Now handles TWO-PHASE architecture:
+    - Reflection phase: Q-head learns when reflection is "complete" (cache is ready)
+    - Answer phase: Q-head learns when answer is "correct" (prediction is good)
     
-    This helps the model learn when to stop iterating vs when to continue.
+    For reflection phase, we use a heuristic: reflection is "complete" when
+    cache state is sufficiently distinct from initial state (learned implicitly).
+    We don't have ground truth for "when is reflection done", so we train it
+    with a soft target based on pass number (later passes should halt).
+    
+    For answer phase, we use actual correctness against test_output.
     
     Now works with sequences: test_output is [B, S] with IGNORE_LABEL for padding.
     """
     model_q_loss = torch.tensor(0.0, device=device)
     features = config.features
     
-    # Get Q-head outputs (now always dual mode: q_halt and q_continue are LOGITS)
+    # no_act_continue: Paper recommends skipping Q_continue loss
+    use_q_continue = not features.no_act_continue
+    
+    # === ANSWER PHASE Q-HEAD LOSS ===
+    # Get answer Q-head outputs (these are LOGITS)
     q_halt_list = aux_info.get('q_halt', [])
     q_continue_list = aux_info.get('q_continue', [])
     
-    if not q_halt_list:
-        return model_q_loss
-    
-    # Get pass logits for computing per-pass correctness
-    pass_logits = aux_info.get('pass_logits', [])
-    final_logits = aux_info.get('final_logits')
-    
-    # no_act_continue: Paper recommends skipping Q_continue loss
-    # "No continue ACT loss, only use the sigmoid of the halt which makes much more sense"
-    use_q_continue = not features.no_act_continue
-    
-    # If we have per-pass logits (deep supervision), compute per-pass loss
-    if pass_logits:
-        total_loss = torch.tensor(0.0, device=device)
-        for i, (q_h_logit, q_c_logit, p_logits) in enumerate(zip(q_halt_list, q_continue_list, pass_logits)):
-            # Per-pass correctness (only in valid positions, not padding)
-            # p_logits: [B, S, vocab_size], test_output: [B, S]
-            preds = p_logits.detach().argmax(dim=-1)  # [B, S]
+    if q_halt_list:
+        # Get pass logits for computing per-pass correctness
+        pass_logits = aux_info.get('pass_logits', [])
+        final_logits = aux_info.get('final_logits')
+        
+        # If we have per-pass logits (deep supervision), compute per-pass loss
+        if pass_logits:
+            total_loss = torch.tensor(0.0, device=device)
+            for i, (q_h_logit, q_c_logit, p_logits) in enumerate(zip(q_halt_list, q_continue_list, pass_logits)):
+                # Per-pass correctness (only in valid positions, not padding)
+                preds = p_logits.detach().argmax(dim=-1)  # [B, S]
+                valid_mask = (test_output != IGNORE_LABEL)  # [B, S]
+                correct_at_valid = (preds == test_output) | ~valid_mask
+                is_correct = correct_at_valid.all(dim=-1).float()  # [B]
+                
+                # BCE with logits (more numerically stable)
+                loss_halt = F.binary_cross_entropy_with_logits(q_h_logit, is_correct.detach())
+                total_loss = total_loss + loss_halt
+                
+                if use_q_continue:
+                    is_wrong = 1.0 - is_correct
+                    loss_cont = F.binary_cross_entropy_with_logits(q_c_logit, is_wrong.detach())
+                    total_loss = total_loss + loss_cont
+            
+            model_q_loss = model_q_loss + total_loss / len(pass_logits)
+        
+        # Otherwise, use final logits only
+        elif final_logits is not None and q_halt_list:
+            q_halt_final = q_halt_list[-1]
+            
+            preds = final_logits.detach().argmax(dim=-1)  # [B, S]
             valid_mask = (test_output != IGNORE_LABEL)  # [B, S]
-            # Compute per-sample correctness: all valid positions must match
-            correct_at_valid = (preds == test_output) | ~valid_mask  # correct or don't care
+            correct_at_valid = (preds == test_output) | ~valid_mask
             is_correct = correct_at_valid.all(dim=-1).float()  # [B]
             
-            # BCE with logits (more numerically stable)
-            loss_halt = F.binary_cross_entropy_with_logits(q_h_logit, is_correct.detach())
-            total_loss = total_loss + loss_halt
+            loss_halt = F.binary_cross_entropy_with_logits(q_halt_final, is_correct.detach())
+            model_q_loss = model_q_loss + loss_halt
             
-            # Q_continue loss (optional, paper recommends skipping)
-            if use_q_continue:
+            if use_q_continue and q_continue_list:
+                q_continue_final = q_continue_list[-1]
                 is_wrong = 1.0 - is_correct
-                loss_cont = F.binary_cross_entropy_with_logits(q_c_logit, is_wrong.detach())
-                total_loss = total_loss + loss_cont
-        
-        model_q_loss = total_loss / len(pass_logits)
+                loss_cont = F.binary_cross_entropy_with_logits(q_continue_final, is_wrong.detach())
+                model_q_loss = model_q_loss + loss_cont
     
-    # Otherwise, use final logits only
-    elif final_logits is not None:
-        q_halt_final = q_halt_list[-1]
+    # === REFLECTION PHASE Q-HEAD LOSS ===
+    # For reflection, we use a soft target: later passes should be more likely to halt
+    # This is a heuristic since we don't know the "true" completion point
+    reflection_q_halt = aux_info.get('reflection_q_halt', [])
+    reflection_q_continue = aux_info.get('reflection_q_continue', [])
+    
+    if reflection_q_halt:
+        num_reflection_passes = len(reflection_q_halt)
+        reflection_loss = torch.tensor(0.0, device=device)
         
-        preds = final_logits.detach().argmax(dim=-1)  # [B, S]
-        valid_mask = (test_output != IGNORE_LABEL)  # [B, S]
-        correct_at_valid = (preds == test_output) | ~valid_mask
-        is_correct = correct_at_valid.all(dim=-1).float()  # [B]
+        for i, (q_h_logit, q_c_logit) in enumerate(zip(reflection_q_halt, reflection_q_continue)):
+            # Soft target: probability of halting increases with pass number
+            # Pass 1: target 0.2, Pass 2: 0.4, Pass 3: 0.6, etc.
+            # This encourages the model to learn when reflection is "enough"
+            halt_target = min(0.8, (i + 1) / num_reflection_passes)
+            batch_size = q_h_logit.shape[0]
+            halt_targets = torch.full((batch_size,), halt_target, device=device)
+            
+            loss_halt = F.binary_cross_entropy_with_logits(q_h_logit, halt_targets)
+            reflection_loss = reflection_loss + loss_halt
+            
+            if use_q_continue:
+                continue_targets = 1.0 - halt_targets
+                loss_cont = F.binary_cross_entropy_with_logits(q_c_logit, continue_targets)
+                reflection_loss = reflection_loss + loss_cont
         
-        # BCE with logits (more numerically stable)
-        loss_halt = F.binary_cross_entropy_with_logits(q_halt_final, is_correct.detach())
-        model_q_loss = loss_halt
-        
-        # Q_continue loss (optional, paper recommends skipping)
-        if use_q_continue:
-            q_continue_final = q_continue_list[-1]
-            is_wrong = 1.0 - is_correct
-            loss_cont = F.binary_cross_entropy_with_logits(q_continue_final, is_wrong.detach())
-            model_q_loss = model_q_loss + loss_cont
+        # Weight reflection Q-loss less than answer (answer correctness is more important)
+        model_q_loss = model_q_loss + 0.5 * reflection_loss / num_reflection_passes
     
     return model_q_loss
 
@@ -448,6 +529,15 @@ def compute_total_loss(
     if read_gates or write_gates:
         gate_polar_loss = compute_gate_polarization_loss(read_gates, write_gates)
 
+    # 8. Read/Write Gate Sparsity Loss - prevents gates from saturating to 1.0
+    gate_sparsity_loss = torch.tensor(0.0, device=device)
+    if read_gates or write_gates:
+        gate_sparsity_loss = compute_read_gate_sparsity_loss(
+            read_gates, write_gates,
+            read_target_ratio=0.4,  # 40% of reads should be open
+            write_target_ratio=0.3  # 30% of writes (more selective)
+        )
+
     # Weighted Sum with NaN protection
     # NOTE: Ponder loss removed - dual Q-head supersedes it
     compute_loss = (
@@ -460,7 +550,8 @@ def compute_total_loss(
     gradient_flow_loss = output_entropy_loss + 0.05 * pred_diversity_loss
     
     # Gate polarization: small weight to encourage decisive gates without dominating
-    gate_loss = 0.01 * gate_polar_loss
+    # Sparsity loss: moderate weight to prevent gate saturation
+    gate_loss = 0.01 * gate_polar_loss + 0.1 * gate_sparsity_loss
 
     total_loss = task_loss + compute_loss + config.lambda_diversity * diversity_loss + gradient_flow_loss + gate_loss
 
@@ -482,6 +573,7 @@ def compute_total_loss(
         'loss_output_entropy': output_entropy_loss.detach().item() if isinstance(output_entropy_loss, torch.Tensor) else output_entropy_loss,
         'loss_pred_diversity': pred_diversity_loss.detach().item() if isinstance(pred_diversity_loss, torch.Tensor) else pred_diversity_loss,
         'loss_gate_polar': gate_polar_loss.detach().item() if isinstance(gate_polar_loss, torch.Tensor) else gate_polar_loss,
+        'loss_gate_sparsity': gate_sparsity_loss.detach().item() if isinstance(gate_sparsity_loss, torch.Tensor) else gate_sparsity_loss,
     }
 
     return total_loss, metrics

@@ -127,23 +127,8 @@ class DLSMN_ARC(nn.Module):
         # Using LinearAttention by default for O(S) memory efficiency
         self.cache_self_attn = CacheSelfAttention(d_cache, num_heads, dropout, use_linear=True)
         
-        # === ACT HALTING (TRM-style Dual Q-head) ===
-        # Q_halt: learns "stop, this is correct"
-        # Q_continue: learns "continue, this is wrong" (optional, paper recommends skipping)
-        # Uses logits (not probabilities) for stable BCE training
-        self.q_head = nn.Sequential(
-            nn.Linear(d_cache, d_cache // 2),
-            nn.SiLU(),
-            nn.Linear(d_cache // 2, 2),  # Output: [q_halt_logit, q_continue_logit]
-        )
-        
-        # [TRM] Refinement read: project cache to model space for answer refinement
-        self.refinement_query = nn.Linear(d_model, d_cache)
-        self.refinement_value = nn.Linear(d_cache, d_model)
-        self.refinement_gate = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
-            nn.Sigmoid(),
-        )
+        # NOTE: Phase-specific Q-heads defined below with step predictors
+        # NOTE: refinement_read removed - refinement happens through multi-pass at layer/module level
         
         # Layer-level: Step Predictor (predicts distribution over recurrent steps)
         # Context-aware: uses layer_idx and pass_num embeddings
@@ -151,6 +136,47 @@ class DLSMN_ARC(nn.Module):
         self.layer_step_embed = nn.Embedding(num_layers, d_model // 4)
         self.pass_step_embed = nn.Embedding(self.max_passes, d_model // 4)
         
+        # === TWO-PHASE ARCHITECTURE ===
+        # Each phase (Reflection, Answer) has its own ACT system:
+        # - Q-head for pass-level halting
+        # - Step predictor for layer-level recurrence
+        # This allows each phase to independently learn how much compute it needs
+        
+        # Phase embedding: 0=reflection, 1=answer
+        self.phase_embed = nn.Embedding(2, d_model // 4)
+        
+        # Phase-specific step predictors
+        # Input: h_pooled + layer_ctx + pass_ctx + phase_ctx -> step distribution
+        step_input_dim = d_model + d_model // 4 + d_model // 4 + d_model // 4
+        
+        self.reflection_step_predictor = nn.Sequential(
+            nn.Linear(step_input_dim, d_model // 2),
+            nn.SiLU(),
+            nn.Linear(d_model // 2, self.max_recurrent_steps),
+        )
+        
+        self.answer_step_predictor = nn.Sequential(
+            nn.Linear(step_input_dim, d_model // 2),
+            nn.SiLU(),
+            nn.Linear(d_model // 2, self.max_recurrent_steps),
+        )
+        
+        # Phase-specific Q-heads for pass-level halting
+        # Q_halt: learns "stop, this phase is complete" based on OUTPUT quality
+        # NOT cache - cache is working memory, not a completion signal
+        self.reflection_q_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.SiLU(),
+            nn.Linear(d_model // 2, 2),  # [q_halt, q_continue]
+        )
+        
+        self.answer_q_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.SiLU(),
+            nn.Linear(d_model // 2, 2),  # [q_halt, q_continue]
+        )
+        
+        # Legacy (kept for compatibility, can remove later)
         # Predictor: h_pooled + layer_ctx + pass_ctx -> step distribution
         self.step_predictor = nn.Sequential(
             nn.Linear(d_model + d_model // 4 + d_model // 4, d_model // 2),
@@ -211,21 +237,27 @@ class DLSMN_ARC(nn.Module):
         init_linear_normal(self.output_proj, std=0.02)
         init_linear_xavier(self.answer_gate)
         
-        # Step predictor
+        # Step predictor (legacy)
         init_sequential(self.step_predictor)
         
-        # === Q-head: Initialize with small values for stable bootstrapping ===
-        # This matches TRM's approach: start Q near zero, let it learn
-        init_sequential(self.q_head)
-        # Set Q-head output bias to slightly negative (initially predict "don't halt")
-        final_layer = list(self.q_head.children())[-1]
-        if isinstance(final_layer, nn.Linear):
-            init_gate_bias(final_layer, initial_value=-1.0)
+        # Phase-specific step predictors
+        init_sequential(self.reflection_step_predictor)
+        init_sequential(self.answer_step_predictor)
         
-        # Refinement modules
-        init_linear_normal(self.refinement_query, std=0.02)
-        init_linear_normal(self.refinement_value, std=0.02)
-        init_sequential(self.refinement_gate, final_is_gate=True, gate_bias=0.0)
+        # Phase embedding
+        init_embedding(self.phase_embed)
+        
+        # === Phase-specific Q-heads: Initialize with small values for stable bootstrapping ===
+        init_sequential(self.reflection_q_head)
+        init_sequential(self.answer_q_head)
+        
+        # Set Q-head output bias to slightly negative (initially predict "don't halt")
+        for q_head in [self.reflection_q_head, self.answer_q_head]:
+            final_layer = list(q_head.children())[-1]
+            if isinstance(final_layer, nn.Linear):
+                init_gate_bias(final_layer, initial_value=-1.0)
+        
+        # NOTE: refinement modules removed - refinement through multi-pass
         
         # Predictor head
         init_sequential(self.predictor)
@@ -377,55 +409,99 @@ class DLSMN_ARC(nn.Module):
         
         return mask
     
-    def refinement_read(
-        self,
-        h: torch.Tensor,     # [B, S, D_model] - answer representation
-        cache: torch.Tensor, # [B, L*K, D_cache]
-    ) -> torch.Tensor:
+    def compute_q_halt(self, h: torch.Tensor, phase: str = 'answer') -> tuple:
         """
-        [TRM] Refinement Read: Answer reads from cache before final output.
+        Compute Q_halt and Q_continue logits from hidden state (TRM-style ACT).
         
-        This allows the answer to benefit from ALL patterns stored during
-        reasoning, not just what was explicitly passed through layers.
+        IMPORTANT: Halting is based on OUTPUT quality, not cache state.
+        The cache is working memory for computation - not a signal of completion.
+        The model should halt when its output is good enough, assessed from h.
         
-        Similar to TinyTRM's refinement step where z_H reads from slots
-        before being projected to output.
-        """
-        B, S, D = h.shape
-        
-        # Query the cache
-        q = self.refinement_query(h)  # [B, S, D_cache]
-        
-        # Attention over cache slots
-        scores = torch.matmul(q, cache.transpose(-2, -1)) / (self.d_cache ** 0.5)
-        attn = F.softmax(scores, dim=-1)  # [B, S, L*K]
-        
-        # Read values
-        context = torch.matmul(attn, self.refinement_value(cache))  # [B, S, D_model]
-        
-        # Gated fusion
-        gate = self.refinement_gate(torch.cat([h, context], dim=-1))
-        h_refined = gate * context + (1 - gate) * h
-        
-        return h_refined
-    
-    def compute_q_halt(self, cache: torch.Tensor) -> tuple:
-        """
-        Compute Q_halt and Q_continue logits from cache state (TRM-style ACT).
+        Args:
+            h: [B, S, D_model] - current hidden state (output of the phase)
+            phase: 'reflection' or 'answer' - selects which Q-head to use
         
         Returns LOGITS (not probabilities). Apply sigmoid for probabilities.
         
-        Q_halt: should be high (positive logit) when prediction is correct → stop
-        Q_continue: should be high when prediction is wrong → continue
-                   (optional, paper recommends skipping Q_continue loss)
+        Q_halt: should be high (positive logit) when output is good → stop
+        Q_continue: should be high when output needs refinement → continue
         
         Inference halting: stop if sigmoid(q_halt) > 0.5 (i.e., q_halt > 0)
         """
-        cache_pooled = cache.mean(dim=1)  # [B, D_cache]
-        q_logits = self.q_head(cache_pooled)  # [B, 2]
+        h_pooled = h.mean(dim=1)  # [B, D_model]
+        
+        if phase == 'reflection':
+            q_logits = self.reflection_q_head(h_pooled)  # [B, 2]
+        else:  # 'answer'
+            q_logits = self.answer_q_head(h_pooled)  # [B, 2]
+        
         q_halt = q_logits[:, 0]  # [B] - logit
         q_continue = q_logits[:, 1]  # [B] - logit
         return q_halt, q_continue
+    
+    def predict_steps(
+        self, 
+        h: torch.Tensor, 
+        layer_idx: int, 
+        pass_num: int, 
+        phase: str,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Predict distribution over recurrent steps for a layer.
+        
+        Args:
+            h: [B, S, D_model] - current hidden state
+            layer_idx: which layer (0 to num_layers-1)
+            pass_num: which pass within the phase (1-indexed)
+            phase: 'reflection' or 'answer'
+            device: torch device
+            
+        Returns:
+            step_logits: [B, max_recurrent_steps] - logits for each step count
+        """
+        B = h.shape[0]
+        
+        h_pooled = h.mean(dim=1)  # [B, D_model]
+        
+        layer_ctx = self.layer_step_embed(
+            torch.tensor(layer_idx, device=device)
+        ).unsqueeze(0).expand(B, -1)  # [B, D//4]
+        
+        pass_ctx = self.pass_step_embed(
+            torch.tensor(min(pass_num - 1, self.max_passes - 1), device=device)
+        ).unsqueeze(0).expand(B, -1)  # [B, D//4]
+        
+        phase_id = 0 if phase == 'reflection' else 1
+        phase_ctx = self.phase_embed(
+            torch.tensor(phase_id, device=device)
+        ).unsqueeze(0).expand(B, -1)  # [B, D//4]
+        
+        predictor_input = torch.cat([h_pooled, layer_ctx, pass_ctx, phase_ctx], dim=-1)
+        
+        if phase == 'reflection':
+            step_logits = self.reflection_step_predictor(predictor_input)
+        else:
+            step_logits = self.answer_step_predictor(predictor_input)
+        
+        return step_logits
+    
+    def init_answer_state(self, test_h: torch.Tensor) -> torch.Tensor:
+        """
+        Initialize answer state from test representation.
+        
+        The answer state starts from test_h (the model's understanding of the test input
+        after reflection phase) and will be refined in the answer phase.
+        
+        Args:
+            test_h: [B, S, D_model] - test portion representation from reflection phase
+            
+        Returns:
+            [B, S, D_model] - initial answer state
+        """
+        # Direct pass-through: gradients flow back to reflection phase
+        # No clone() - we WANT gradients to propagate through both phases
+        return test_h
     
     def forward(
         self,
@@ -437,9 +513,20 @@ class DLSMN_ARC(nn.Module):
         return_aux: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
-        Unified forward pass following DLSM_V0.1.md (Section 11).
+        Two-Phase Forward Pass:
         
-        Now uses flat sequences instead of 2D grids.
+        === PHASE 1: REFLECTION ===
+        Process [demos, test_input] to fill cache with patterns.
+        - Demos teach the transformation pattern
+        - Test input context is encoded
+        - Cache accumulates relevant patterns
+        
+        === PHASE 2: ANSWER ===
+        Generate/refine answer by reading from cache.
+        - answer_state initialized from test_h (reflection output)
+        - Same layers used, read/write to cache enabled
+        - Multiple passes refine the answer
+        
         Returns: (logits, cache, aux_info)
         - logits: [B, S, vocab_size] - predictions for test output sequence
         - cache: [B, L*K, D_cache] - final cache state
@@ -451,50 +538,43 @@ class DLSMN_ARC(nn.Module):
         B = test_input.shape[0]
         device = test_input.device
         num_demos = demo_inputs.shape[1]
-        S = test_input.shape[1]  # Sequence length (MAX_SEQ_LEN)
+        S = test_input.shape[1]  # Sequence length (MAX_SEQ_LEN = 900)
         
         temperature = config.get_temperature(step)
         hard = (temperature < 0.2)  # Use hard routing when temperature is low
-        threshold = config.write_threshold
         features = config.features
         
-        # Always use adaptive mode - efficiency losses drive reduction
-        pass_mode = 'adaptive'
-        force_max_passes = False
-        use_ponder = True  # Always apply ponder loss
-        
-        # Determine number of passes (with curriculum learning)
+        # Determine number of answer passes (with curriculum learning)
         if features.use_multi_pass:
-            num_passes = config.get_curriculum_passes(step)
+            num_answer_passes = config.get_curriculum_passes(step)
         else:
-            num_passes = 1
+            num_answer_passes = 1
         
-        # Build unified sequence from demos + test input
-        # All context (demos + test_input) gets segment=0 (context)
+        # === BUILD REFLECTION SEQUENCE ===
+        # All context (demos + test_input) processed together
         # Using TRM-style aligned sequences: 30x30 grid → 900 tokens
-        # Position i corresponds to same spatial location for input and output
-        seq_parts = []
+        reflection_parts = []
         
         for demo_idx in range(num_demos):
-            # Demo input (context, 30x30 padded grid flattened)
+            # Demo input
             demo_in = self.embed_sequence(demo_inputs[:, demo_idx], is_answer=False)
-            seq_parts.append(demo_in)
+            reflection_parts.append(demo_in)
             
-            # Demo output (context, aligned with demo input)
+            # Demo output (aligned with demo input)
             demo_out = self.embed_sequence(demo_outputs[:, demo_idx], is_answer=False)
-            seq_parts.append(demo_out)
+            reflection_parts.append(demo_out)
         
-        # Test input (context, 30x30 padded grid flattened)
+        # Test input
         test_emb = self.embed_sequence(test_input, is_answer=False)
         test_start_idx = num_demos * 2 * S  # Position where test starts in concatenated sequence
-        seq_parts.append(test_emb)
+        reflection_parts.append(test_emb)
         
-        full_seq = torch.cat(seq_parts, dim=1)  # [B, total_seq_len, D_model]
-        total_seq_len = full_seq.shape[1]
+        reflection_seq = torch.cat(reflection_parts, dim=1)  # [B, 6300, D_model] typically
+        reflection_len = reflection_seq.shape[1]
         
-        # === RoPE: Get cos/sin for this sequence length ===
-        # RoPE encodes position via rotation in attention, not embeddings
-        cos_sin = self.rotary_emb(seq_len=total_seq_len)
+        # === RoPE: Get cos/sin for sequences ===
+        cos_sin_reflection = self.rotary_emb(seq_len=reflection_len)
+        cos_sin_answer = self.rotary_emb(seq_len=S)  # Answer is just S tokens
         
         # Initialize cache
         cache = self.get_initial_cache(B, device, features)
@@ -507,119 +587,78 @@ class DLSMN_ARC(nn.Module):
             'q_halt': [],      # Q-head halting logits
             'q_continue': [],  # Q-head continue logits (optional)
             'layer_steps': [],  # Track actual recurrent steps per layer
+            'read_gates': [],
+            'write_gates': [],
         }
         
         cumulative_halt = torch.zeros(B, device=device)
         total_ponder_cost = 0.0
-        total_layer_steps = 0  # Total recurrent steps across all passes/layers
+        total_layer_steps = 0  # Total recurrent steps across all phases
         
-        write_counts = torch.zeros(B, self.total_slots, device=device)
-        slot_ages = torch.zeros(B, self.total_slots, device=device)
+        # Use the model's max_recurrent_steps (matches step_predictor output size)
+        max_recurrent_steps = self.max_recurrent_steps
+        curriculum_max_recurrence = config.get_curriculum_recurrence(step)
         
-        # === INPUT INJECTION MASK (DEMOS ONLY) ===
-        # Create a mask that zeros out the test portion of embeddings
-        # This prevents identity shortcuts where model copies test_input → test_output
-        # Demo portions (indices 0 to test_start_idx) get injection, test doesn't
-        demo_only_seq = full_seq.clone()
-        demo_only_seq[:, test_start_idx:, :] = 0.0  # Zero out test portion
+        # Number of passes for each phase (both use curriculum learning)
+        if features.use_multi_pass:
+            num_reflection_passes = config.get_curriculum_passes(step)
+            num_answer_passes = config.get_curriculum_passes(step)
+        else:
+            num_reflection_passes = 1
+            num_answer_passes = 1
         
-        h = full_seq
-        pass_num = 1
-        pass_logits = None
-        prev_answer = None
+        # ===================================================================
+        # PHASE 1: REFLECTION
+        # Process demos + test_input to fill cache with transformation patterns
+        # Multiple passes with adaptive recurrence per layer
+        # ===================================================================
+        h = reflection_seq
+        reflection_cumulative_halt = torch.zeros(B, device=device)
+        reflection_pass = 1  # Will be updated in loop
         
-        # Only last pass gets gradients (memory optimization)
-        # With AdamAtan2, we could train all passes without explosion, but this saves memory.
-        for pass_num in range(1, num_passes + 1):
-            is_no_grad_pass = (pass_num < num_passes) and self.training and features.use_gradient_free_passes
-            
-            # Answer Feedback: incorporate previous prediction into test embedding
-            if pass_num > 1 and features.use_answer_feedback and prev_answer is not None:
-                # prev_answer is [B, S] - sequence of predicted tokens
-                prev_answer_emb = self.answer_embed(prev_answer.detach())  # [B, S, D_model]
-                
-                test_emb_orig = full_seq[:, test_start_idx:test_start_idx + S]  # [B, S, D_model]
-                combined = torch.cat([test_emb_orig, prev_answer_emb], dim=-1)  # [B, S, 2*D_model]
-                gate = torch.sigmoid(self.answer_gate(combined))  # [B, S, D_model]
-                test_emb_refined = gate * test_emb_orig + (1 - gate) * prev_answer_emb
-                
-                h = torch.cat([full_seq[:, :test_start_idx], test_emb_refined], dim=1)
-            else:
-                h = full_seq
-            
+        for reflection_pass in range(1, num_reflection_passes + 1):
+            is_no_grad_pass = (reflection_pass < num_reflection_passes) and self.training and features.use_gradient_free_passes
             context = torch.no_grad() if is_no_grad_pass else nullcontext()
             
-            # Use the model's max_recurrent_steps (matches step_predictor output size)
-            # Apply curriculum learning cap if enabled
-            max_recurrent_steps = self.max_recurrent_steps
-            curriculum_max_recurrence = config.get_curriculum_recurrence(step)
-            
-            # === EFFICIENT STEP SELECTION PER LAYER ===
-            # During training: run fixed max steps but weight by step_probs for gradient
-            # During inference: can use argmax for actual compute savings
-            pass_expected_steps = []  # Collect for efficiency loss
+            pass_expected_steps = []
+            updates = None
             
             with context:
                 for layer_idx, layer in enumerate(self.layers):
-                    # Predict step distribution for this layer
-                    h_pooled = h.mean(dim=1)  # [B, D]
-                    layer_ctx = self.layer_step_embed(
-                        torch.tensor(layer_idx, device=device)
-                    ).unsqueeze(0).expand(B, -1)  # [B, D//4]
-                    pass_ctx = self.pass_step_embed(
-                        torch.tensor(min(pass_num - 1, self.max_passes - 1), device=device)
-                    ).unsqueeze(0).expand(B, -1)  # [B, D//4]
+                    # Predict step distribution for this layer (reflection phase)
+                    step_logits = self.predict_steps(h, layer_idx, reflection_pass, 'reflection', device)
                     
-                    predictor_input = torch.cat([h_pooled, layer_ctx, pass_ctx], dim=-1)
-                    step_logits = self.step_predictor(predictor_input)  # [B, max_steps]
-                    
-                    # Curriculum learning: mask out steps beyond current curriculum cap
-                    # This ensures the model only learns to predict within available range
+                    # Curriculum learning: mask unavailable steps
                     if curriculum_max_recurrence < max_recurrent_steps:
-                        # Mask logits for unavailable steps with -inf
                         mask = torch.zeros_like(step_logits)
                         mask[:, curriculum_max_recurrence:] = float('-inf')
                         step_logits = step_logits + mask
                     
                     step_temp = max(temperature, 0.5)
-                    step_probs = F.softmax(step_logits / step_temp, dim=-1)  # [B, max_steps]
+                    step_probs = F.softmax(step_logits / step_temp, dim=-1)
                     step_probs = step_probs.clamp(min=1e-6, max=1.0 - 1e-6)
                     
                     # Expected steps (differentiable) - for efficiency loss
                     steps_range = torch.arange(1, max_recurrent_steps + 1, device=device, dtype=torch.float)
-                    expected_steps = (step_probs * steps_range).sum(dim=-1)  # [B]
+                    expected_steps = (step_probs * steps_range).sum(dim=-1)
                     pass_expected_steps.append(expected_steps)
                     
-                    # === VARIABLE STEPS: Actually use predicted steps ===
-                    # Training: Sample from distribution (with Gumbel noise for exploration)
-                    # Inference: Use expected value (deterministic)
+                    # Determine actual steps to run
                     if features.use_layer_act:
                         if self.training:
-                            # Sample number of steps per batch item
-                            # Use categorical sampling with straight-through for gradients
                             with torch.no_grad():
-                                sampled_steps = torch.multinomial(step_probs, num_samples=1).squeeze(-1)  # [B]
-                            # Use max across batch to ensure all items get processed
-                            # (simpler than per-item variable steps, still learns from distribution)
+                                sampled_steps = torch.multinomial(step_probs, num_samples=1).squeeze(-1)
                             num_steps_to_run = max(1, int(sampled_steps.float().mean().item() + 0.5))
                         else:
-                            # Inference: use expected steps (deterministic)
                             num_steps_to_run = max(1, int(expected_steps.mean().item() + 0.5))
-                        
-                        # Apply curriculum cap during training
                         num_steps_to_run = min(num_steps_to_run, curriculum_max_recurrence)
                     else:
-                        # Layer ACT disabled: always 1 step
                         num_steps_to_run = 1
                     
-                    # Track actual steps for logging
                     aux_data['layer_steps'].append(num_steps_to_run)
                     total_layer_steps += num_steps_to_run
                     
-                    # Use demo-only injection (test portion zeroed out)
-                    input_injection = demo_only_seq
-                    
-                    # Only last recurrent step gets gradients (memory optimization)
+                    # Run recurrent steps
                     for recur_step in range(num_steps_to_run):
                         is_last_recur_step = (recur_step == num_steps_to_run - 1)
                         step_context = nullcontext() if (is_last_recur_step and not is_no_grad_pass) else torch.no_grad()
@@ -627,155 +666,235 @@ class DLSMN_ARC(nn.Module):
                         with step_context:
                             h, cache, updates = layer(
                                 h, cache, 
-                                cos_sin=cos_sin,
-                                input_injection=input_injection,
+                                cos_sin=cos_sin_reflection,
+                                input_injection=None,
                                 temperature=temperature, 
                                 hard=hard, 
                                 features=features,
                             )
-                        
-                        # Track slot usage for diversity regularization
-                        if features.use_cache:
-                            start_idx = layer_idx * self.num_slots
-                            end_idx = start_idx + self.num_slots
-                            layer_slot_counts = updates['slot_probs'].sum(dim=1)
-                            write_counts[:, start_idx:end_idx] += layer_slot_counts
-                            
-                            slot_ages += 1
-                            written_mask = (layer_slot_counts > 1e-3).float()
-                            slot_ages[:, start_idx:end_idx] = slot_ages[:, start_idx:end_idx] * (1 - written_mask)
                     
-                    # === CACHE SELF-ATTENTION AFTER WRITE (v0.1.1 §9.1) ===
-                    # Apply cache-to-cache attention AFTER each layer writes
-                    # This enables inter-slot reasoning with pass-aware masking:
-                    # - Pass 1: Causal (layer N attends to 0..N-1 only)
-                    # - Pass 2+: Full attention (all slots see all slots)
+                    # Cache self-attention after layer (pass-aware)
                     if features.use_cache_self_attn and features.use_cache:
-                        cache_attn_mask = self.get_cache_self_attn_mask(
-                            layer_idx, pass_num, device
-                        )
+                        cache_attn_mask = self.get_cache_self_attn_mask(layer_idx, reflection_pass, device)
                         cache = self.cache_self_attn(cache, attn_mask=cache_attn_mask)
                     
-                    # Log only final step stats
-                    if return_aux and features.use_cache:
+                    # Log stats
+                    if updates is not None and features.use_cache:
                         aux_data['entropy'].append(updates['entropy'].detach())
                         aux_data['slot_counts'].append(updates['slot_counts'].detach())
-                        
-                        if 'read_gates' not in aux_data: aux_data['read_gates'] = []
-                        if 'write_gates' not in aux_data: aux_data['write_gates'] = []
-                        
                         aux_data['read_gates'].append(updates['read_gate'].detach())
                         aux_data['write_gates'].append(updates['write_gate'].detach())
             
-            # Collect expected steps for this pass
-            # MEMORY OPTIMIZATION: Detach expected_steps from earlier passes
-            # The efficiency loss only needs gradients from the current pass
-            # We keep the values for computing the loss, but break the graph
-            if 'expected_steps' not in aux_data: aux_data['expected_steps'] = []
-            current_expected_steps = torch.stack(pass_expected_steps, dim=1)  # [B, num_layers]
-            
-            # Detach all previous expected_steps to free memory
-            # Only the last pass (or current accumulation) needs gradients
-            if pass_num < num_passes:
-                aux_data['expected_steps'].append(current_expected_steps.detach())
+            # Collect expected steps for this reflection pass
+            if 'reflection_expected_steps' not in aux_data: aux_data['reflection_expected_steps'] = []
+            current_expected_steps = torch.stack(pass_expected_steps, dim=1)
+            if reflection_pass < num_reflection_passes:
+                aux_data['reflection_expected_steps'].append(current_expected_steps.detach())
             else:
-                # Last pass - keep gradients for backprop
-                aux_data['expected_steps'].append(current_expected_steps)
+                aux_data['reflection_expected_steps'].append(current_expected_steps)
             
-            # NOTE: Cache self-attention now happens AFTER each layer's write (above)
-            # with pass-aware masking. The between-pass consolidation is kept as optional
-            # "sleep-like" global consolidation for backward compatibility.
-            if pass_num < num_passes and features.use_cache_self_attn and features.use_between_pass_consolidation:
-                # Full unmasked attention between passes (global consolidation)
+            # Optional cache consolidation between passes
+            if reflection_pass < num_reflection_passes and features.use_cache_self_attn and features.use_between_pass_consolidation:
                 cache = self.cache_self_attn(cache, attn_mask=None)
-                # MEMORY OPTIMIZATION: Detach cache after self-attention between passes
-                # This breaks the gradient chain but dramatically reduces memory
                 if features.detach_cache_between_passes:
                     cache = cache.detach()
             
-            # Compute Q-head halting signals
-            q_halt, q_continue = self.compute_q_halt(cache)
-            # MEMORY OPTIMIZATION: Only keep gradients for the last pass
-            if pass_num < num_passes:
-                aux_data['q_halt'].append(q_halt.detach())
-                aux_data['q_continue'].append(q_continue.detach())
+            # Compute Q-head halting for reflection phase (based on output h, not cache)
+            q_halt, q_continue = self.compute_q_halt(h, phase='reflection')
+            if 'reflection_q_halt' not in aux_data: aux_data['reflection_q_halt'] = []
+            if 'reflection_q_continue' not in aux_data: aux_data['reflection_q_continue'] = []
+            
+            if reflection_pass < num_reflection_passes:
+                aux_data['reflection_q_halt'].append(q_halt.detach())
+                aux_data['reflection_q_continue'].append(q_continue.detach())
             else:
-                aux_data['q_halt'].append(q_halt)
-                aux_data['q_continue'].append(q_continue)
+                aux_data['reflection_q_halt'].append(q_halt)
+                aux_data['reflection_q_continue'].append(q_continue)
             
-            # [TRM] Refinement read: answer reads from cache before output
-            # test_h is [B, S, D_model] - the test portion of the sequence
-            test_h = h[:, test_start_idx:test_start_idx + S]
-            if features.use_refinement_read and pass_num == num_passes:
-                test_h = self.refinement_read(test_h, cache)
+            # ACT halting for reflection
+            if features.use_act_halting:
+                halt_prob = torch.sigmoid(q_halt)
+                remaining = 1 - reflection_cumulative_halt
+                total_ponder_cost += remaining.mean()
+                reflection_cumulative_halt = reflection_cumulative_halt + (1 - reflection_cumulative_halt) * halt_prob
+                
+                if not self.training and halt_prob.mean() > 0.5:
+                    break
+        
+        # Extract test_h from reflection output
+        test_h = h[:, test_start_idx:test_start_idx + S]  # [B, S, D_model]
+        
+        # ===================================================================
+        # PHASE 2: ANSWER
+        # Generate/refine answer using cached knowledge
+        # Multiple passes with adaptive recurrence per layer
+        # ===================================================================
+        
+        # Initialize answer state from test representation
+        answer_state = self.init_answer_state(test_h)  # [B, S, D_model]
+        
+        pass_logits = None
+        prev_answer = None
+        answer_cumulative_halt = torch.zeros(B, device=device)
+        answer_pass = 1  # Will be updated in loop
+        
+        for answer_pass in range(1, num_answer_passes + 1):
+            is_no_grad_pass = (answer_pass < num_answer_passes) and self.training and features.use_gradient_free_passes
             
-            # NOTE: Gradient highway removed - it was creating a shortcut where the model
-            # could just pass through input colors instead of learning transformations.
-            # Gradient flow to embeddings is maintained via:
-            # 1. Refinement read (above) - cache contains embedded info
-            # 2. Normal backprop through attention and memory operations
-            # 3. The pred_diversity_loss which provides direct gradient signal
+            # Answer Feedback: incorporate previous prediction
+            if answer_pass > 1 and features.use_answer_feedback and prev_answer is not None:
+                prev_answer_emb = self.answer_embed(prev_answer.detach())  # [B, S, D_model]
+                combined = torch.cat([answer_state, prev_answer_emb], dim=-1)  # [B, S, 2*D_model]
+                gate = torch.sigmoid(self.answer_gate(combined))  # [B, S, D_model]
+                answer_state = gate * answer_state + (1 - gate) * prev_answer_emb
             
-            # Output: [B, S, vocab_size] - logits for each position in output sequence
-            pass_logits = self.output_proj(test_h)  # [B, S, vocab_size]
+            context = torch.no_grad() if is_no_grad_pass else nullcontext()
             
-            # Only store pass_logits if deep supervision enabled (memory optimization)
+            pass_expected_steps = []
+            
+            with context:
+                h_answer = answer_state
+                updates = None
+                
+                for layer_idx, layer in enumerate(self.layers):
+                    # Predict step distribution for this layer (answer phase)
+                    step_logits = self.predict_steps(h_answer, layer_idx, answer_pass, 'answer', device)
+                    
+                    # Curriculum learning: mask unavailable steps
+                    if curriculum_max_recurrence < max_recurrent_steps:
+                        mask = torch.zeros_like(step_logits)
+                        mask[:, curriculum_max_recurrence:] = float('-inf')
+                        step_logits = step_logits + mask
+                    
+                    step_temp = max(temperature, 0.5)
+                    step_probs = F.softmax(step_logits / step_temp, dim=-1)
+                    step_probs = step_probs.clamp(min=1e-6, max=1.0 - 1e-6)
+                    
+                    # Expected steps (differentiable) - for efficiency loss
+                    steps_range = torch.arange(1, max_recurrent_steps + 1, device=device, dtype=torch.float)
+                    expected_steps = (step_probs * steps_range).sum(dim=-1)
+                    pass_expected_steps.append(expected_steps)
+                    
+                    # Determine actual steps to run
+                    if features.use_layer_act:
+                        if self.training:
+                            with torch.no_grad():
+                                sampled_steps = torch.multinomial(step_probs, num_samples=1).squeeze(-1)
+                            num_steps_to_run = max(1, int(sampled_steps.float().mean().item() + 0.5))
+                        else:
+                            num_steps_to_run = max(1, int(expected_steps.mean().item() + 0.5))
+                        num_steps_to_run = min(num_steps_to_run, curriculum_max_recurrence)
+                    else:
+                        num_steps_to_run = 1
+                    
+                    aux_data['layer_steps'].append(num_steps_to_run)
+                    total_layer_steps += num_steps_to_run
+                    
+                    # Run layer on answer state
+                    for recur_step in range(num_steps_to_run):
+                        is_last_recur_step = (recur_step == num_steps_to_run - 1)
+                        step_context = nullcontext() if (is_last_recur_step and not is_no_grad_pass) else torch.no_grad()
+                        
+                        with step_context:
+                            h_answer, cache, updates = layer(
+                                h_answer, cache, 
+                                cos_sin=cos_sin_answer,
+                                input_injection=None,
+                                temperature=temperature, 
+                                hard=hard, 
+                                features=features,
+                            )
+                    
+                    # Cache self-attention after layer
+                    # Use pass_num = reflection_passes + answer_pass for proper masking
+                    effective_pass = num_reflection_passes + answer_pass
+                    if features.use_cache_self_attn and features.use_cache:
+                        cache_attn_mask = self.get_cache_self_attn_mask(layer_idx, effective_pass, device)
+                        cache = self.cache_self_attn(cache, attn_mask=cache_attn_mask)
+                    
+                    # Log stats
+                    if updates is not None and features.use_cache:
+                        aux_data['entropy'].append(updates['entropy'].detach())
+                        aux_data['slot_counts'].append(updates['slot_counts'].detach())
+                        aux_data['read_gates'].append(updates['read_gate'].detach())
+                        aux_data['write_gates'].append(updates['write_gate'].detach())
+                
+                answer_state = h_answer
+            
+            # Collect expected steps for this answer pass
+            if 'answer_expected_steps' not in aux_data: aux_data['answer_expected_steps'] = []
+            current_expected_steps = torch.stack(pass_expected_steps, dim=1)
+            
+            if answer_pass < num_answer_passes:
+                aux_data['answer_expected_steps'].append(current_expected_steps.detach())
+            else:
+                aux_data['answer_expected_steps'].append(current_expected_steps)
+            
+            # Optional cache consolidation between passes
+            if answer_pass < num_answer_passes and features.use_cache_self_attn and features.use_between_pass_consolidation:
+                cache = self.cache_self_attn(cache, attn_mask=None)
+                if features.detach_cache_between_passes:
+                    cache = cache.detach()
+            
+            # Compute Q-head halting for answer phase (based on answer_state, not cache)
+            q_halt, q_continue = self.compute_q_halt(answer_state, phase='answer')
+            aux_data['q_halt'].append(q_halt if answer_pass == num_answer_passes else q_halt.detach())
+            aux_data['q_continue'].append(q_continue if answer_pass == num_answer_passes else q_continue.detach())
+            
+            # Output logits directly from answer_state
+            # Refinement happens through multi-pass mechanism, not a separate read
+            pass_logits = self.output_proj(answer_state)  # [B, S, vocab_size]
+            
             if features.use_deep_supervision:
                 if 'pass_logits' not in aux_data: aux_data['pass_logits'] = []
                 aux_data['pass_logits'].append(pass_logits)
             
-            # prev_answer is [B, S] - predicted token for each position
             prev_answer = pass_logits.detach().argmax(dim=-1)
             
-            # === ACT HALTING ===
-            # During inference: stop if Q_halt predicts "correct" (positive logit → prob > 0.5)
-            # During training: always run all passes (halting learned via Q-head loss)
-            if features.use_act_halting and not force_max_passes:
-                # Ponder cost: penalize remaining computation
+            # ACT halting for answer phase
+            if features.use_act_halting:
                 halt_prob = torch.sigmoid(q_halt)
-                remaining = 1 - cumulative_halt
-                if use_ponder:
-                    total_ponder_cost += remaining.mean()
-                cumulative_halt = cumulative_halt + (1 - cumulative_halt) * halt_prob
+                remaining = 1 - answer_cumulative_halt
+                total_ponder_cost += remaining.mean()
+                answer_cumulative_halt = answer_cumulative_halt + (1 - answer_cumulative_halt) * halt_prob
                 
-                # Early stopping during inference only
                 if not self.training and halt_prob.mean() > 0.5:
                     break
         
-        if pass_logits is None:
-            test_h = h[:, test_start_idx:test_start_idx + S]
-            pass_logits = self.output_proj(test_h)  # [B, S, vocab_size]
         logits = pass_logits
+        
+        # Combine expected steps from both phases for efficiency loss
+        all_expected_steps = aux_data.get('reflection_expected_steps', []) + aux_data.get('answer_expected_steps', [])
         
         aux_info = {
             'temperature': temperature, 
-            'pass_mode': pass_mode,
+            'pass_mode': 'two_phase',
             'ponder_cost': total_ponder_cost, 
-            'num_passes': pass_num,
+            'num_reflection_passes': reflection_pass,
+            'num_answer_passes': answer_pass,
+            'num_passes': reflection_pass + answer_pass,  # Total passes
             'pass_logits': aux_data.get('pass_logits', []),
-            'final_logits': logits,  # For Q-head loss without deep supervision
-            'expected_steps': aux_data.get('expected_steps', []),  # For step efficiency loss
-            'q_halt': aux_data['q_halt'],       # Q-head halt logits per pass
-            'q_continue': aux_data['q_continue'],  # Q-head continue logits per pass
-            # Pass/step statistics for monitoring
-            'total_layer_steps': total_layer_steps,  # Total recurrent steps across all passes/layers
-            'layer_steps': aux_data.get('layer_steps', []),  # Steps per layer (flattened across passes)
-            'avg_layer_steps': total_layer_steps / max(1, len(self.layers) * pass_num),  # Avg steps per layer
-            'max_layer_steps': self.max_recurrent_steps,  # For computing utilization
-            'max_passes': num_passes,  # Max allowed passes (for utilization)
+            'final_logits': logits,
+            'expected_steps': all_expected_steps,
+            'reflection_expected_steps': aux_data.get('reflection_expected_steps', []),
+            'answer_expected_steps': aux_data.get('answer_expected_steps', []),
+            'q_halt': aux_data['q_halt'],  # Answer phase Q-halts
+            'q_continue': aux_data['q_continue'],
+            'reflection_q_halt': aux_data.get('reflection_q_halt', []),
+            'reflection_q_continue': aux_data.get('reflection_q_continue', []),
+            # Statistics
+            'total_layer_steps': total_layer_steps,
+            'layer_steps': aux_data.get('layer_steps', []),
+            'avg_layer_steps': total_layer_steps / max(1, len(self.layers) * (reflection_pass + answer_pass)),
+            'max_layer_steps': self.max_recurrent_steps,
+            'max_passes': num_reflection_passes + num_answer_passes,
         }
         
-        if 'layer_halt_probs' in aux_data: aux_info['layer_halt_probs'] = aux_data['layer_halt_probs']
-        if 'layer_stability' in aux_data: aux_info['layer_stability'] = aux_data['layer_stability']
+        if aux_data['entropy']:
+            aux_info['avg_entropy'] = torch.stack(aux_data['entropy']).mean()
+            aux_info['slot_counts'] = aux_data['slot_counts']
         
-        if return_aux:
-            if aux_data['entropy']:
-                aux_info['avg_entropy'] = torch.stack(aux_data['entropy']).mean()
-                aux_info['slot_counts'] = aux_data['slot_counts']
-            
-            # [LOGGING] Add collected stats to output
-            if 'read_gates' in aux_data: aux_info['read_gates'] = aux_data['read_gates']
-            if 'write_gates' in aux_data: aux_info['write_gates'] = aux_data['write_gates']
-            if 'read_slots' in aux_data: aux_info['read_slots'] = aux_data['read_slots']
+        if 'read_gates' in aux_data: aux_info['read_gates'] = aux_data['read_gates']
+        if 'write_gates' in aux_data: aux_info['write_gates'] = aux_data['write_gates']
             
         return logits, cache, aux_info

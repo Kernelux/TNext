@@ -487,9 +487,8 @@ class MemoryRouter(nn.Module):
         self.to_cache = nn.Linear(d_model, d_cache)
         self.from_cache = nn.Linear(d_cache, d_model)
         
-        # Pre-projection normalization
-        self.pre_to_cache_norm = nn.LayerNorm(d_model)
-        self.pre_from_cache_norm = nn.LayerNorm(d_cache)
+        # Note: Pre-projection LayerNorms removed - AdamAtan2 handles gradient magnitude
+        # and removing them preserves more information in the representations
         
         # === READ Controls ===
         # g_read: "Should this token read from memory?"
@@ -517,11 +516,8 @@ class MemoryRouter(nn.Module):
             nn.Sigmoid(),
         )
         
-        # Write input normalization
-        self.write_input_norm = nn.LayerNorm(d_model + d_cache)
-
-        # Gate input normalization
-        self.read_gate_input_norm = nn.LayerNorm(d_cache * 2)
+        # Note: External input norms removed - MLPs have internal LayerNorms
+        # and AdamAtan2 handles gradient magnitude
         
         # Note: Slot selection uses direct attention (pattern @ local_cache^T)
         # No learned eviction_scorer needed - attention similarity determines
@@ -591,8 +587,8 @@ class MemoryRouter(nn.Module):
         B, S, D = x.shape
         device = x.device
         
-        # Project input to cache space
-        x_cache = self.to_cache(self.pre_to_cache_norm(x))  # [B, S, D_cache]
+        # Project input to cache space (no pre-norm - AdamAtan2 handles gradients)
+        x_cache = self.to_cache(x)  # [B, S, D_cache]
         
         # === STEP 1: "Should I read?" - Hard Gate ===
         if cache is not None and cache.shape[1] > 0:
@@ -605,7 +601,7 @@ class MemoryRouter(nn.Module):
         # Gate decision: does this token need cache context?
         # Input: [token_repr, cache_context] → gate logit
         combined = torch.cat([x_cache, context_cache], dim=-1)  # [B, S, 2*D_cache]
-        combined = self.read_gate_input_norm(combined)
+        # MLP has internal LayerNorm as first layer
         read_gate_logit = self.read_gate_mlp(combined)  # [B, S, 1]
         
         # Soft gate with STE for hard decisions
@@ -622,8 +618,8 @@ class MemoryRouter(nn.Module):
         # context_cache contains the attended values from cache
         
         # === STEP 3: "How to fuse?" - Gated additive fusion ===
-        # Project context back to model space
-        context = self.from_cache(self.pre_from_cache_norm(context_cache))  # [B, S, D_model]
+        # Project context back to model space (no pre-norm - AdamAtan2 handles gradients)
+        context = self.from_cache(context_cache)  # [B, S, D_model]
         
         # Additive fusion: x_fused = x + read_gate * context
         # - If read_gate = 1: x + context (use cache)
@@ -674,8 +670,8 @@ class MemoryRouter(nn.Module):
         K = self.num_slots
         device = tokens.device
         
-        # Project tokens to cache space
-        t_cache = self.to_cache(self.pre_to_cache_norm(tokens))  # [B, T, D_cache]
+        # Project tokens to cache space (no pre-norm - AdamAtan2 handles gradients)
+        t_cache = self.to_cache(tokens)  # [B, T, D_cache]
         
         # === STEP 1: "Should I write?" - Hard Gate ===
         # Assess novelty by comparing to global cache
@@ -698,7 +694,7 @@ class MemoryRouter(nn.Module):
                 context_cache = context_cache[:, :tokens.shape[1], :]
                 
         combined = torch.cat([tokens, context_cache], dim=-1)  # [B, T, D + D_cache]
-        combined = self.write_input_norm(combined)
+        # MLP has internal LayerNorm as first layer
         write_gate_logit = self.write_gate_mlp(combined)  # [B, T, 1]
         
         # Soft gate with STE for hard decisions
@@ -896,4 +892,6 @@ class CacheSelfAttention(nn.Module):
         else:
             attn_out, _ = self.attn(cache, cache, cache)
         
-        return self.norm(cache + attn_out)
+        # Residual connection without LayerNorm - AdamAtan2 handles gradient magnitude
+        # and this preserves cache magnitude information for slot diversity
+        return cache + attn_out

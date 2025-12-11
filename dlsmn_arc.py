@@ -36,8 +36,8 @@ from components import (
 )
 from components.dataset import (
     VOCAB_SIZE, MAX_SEQ_LEN, PAD_TOKEN, EOS_TOKEN, COLOR_OFFSET,
-    INPUT_MARKER, OUTPUT_MARKER,
-    sequence_to_grid, grid_to_sequence
+    INPUT_MARKER, OUTPUT_MARKER, MAX_GRID_SIZE,
+    grid_to_sequence,  # Note: sequence_to_grid defined locally for TRM-style
 )
 
 
@@ -85,19 +85,21 @@ def monitor_gradients(model: DLSMN_ARC, writer: Optional[SummaryWriter], step: i
         if param.grad is not None:
             grad_stats[f'cache_attn/{name}'] = param.grad.abs().mean().item()
     
-    # === 4. Q-Head (halting) ===
-    for i, layer in enumerate(model.q_head):
-        if hasattr(layer, 'weight') and layer.weight.grad is not None:
-            grad_stats[f'q_head/{i}'] = layer.weight.grad.abs().mean().item()
+    # === 4. Phase-specific Q-Heads (halting) ===
+    for phase_name, q_head in [('reflection', model.reflection_q_head), ('answer', model.answer_q_head)]:
+        for i, layer in enumerate(q_head):
+            if hasattr(layer, 'weight') and layer.weight.grad is not None:
+                grad_stats[f'q_head_{phase_name}/{i}'] = layer.weight.grad.abs().mean().item()
     
     # === 5. Output Head ===
     if model.output_proj.weight.grad is not None:
         grad_stats['output/proj'] = model.output_proj.weight.grad.abs().mean().item()
     
-    # === 6. Step Predictor ===
-    for i, layer in enumerate(model.step_predictor):
-        if hasattr(layer, 'weight') and layer.weight.grad is not None:
-            grad_stats[f'step_pred/{i}'] = layer.weight.grad.abs().mean().item()
+    # === 6. Phase-specific Step Predictors ===
+    for phase_name, step_pred in [('reflection', model.reflection_step_predictor), ('answer', model.answer_step_predictor)]:
+        for i, layer in enumerate(step_pred):
+            if hasattr(layer, 'weight') and layer.weight.grad is not None:
+                grad_stats[f'step_pred_{phase_name}/{i}'] = layer.weight.grad.abs().mean().item()
     
     # === Log to TensorBoard ===
     if writer is not None:
@@ -202,111 +204,138 @@ def grid_to_rgb(grid: np.ndarray, cell_size: int = 10) -> np.ndarray:
 
 def prediction_to_grid(prediction: np.ndarray, target: np.ndarray) -> np.ndarray:
     """
-    Convert prediction sequence to grid using target's structure.
+    Convert prediction sequence to grid using TRM-style aligned format.
     
-    The prediction and target are aligned position-by-position.
-    Target uses -100 (IGNORE_LABEL) for positions we don't evaluate (EOS, PAD, role markers).
-    We use the target's valid positions (not -100) to determine the grid shape.
+    The prediction and target are both 30x30 flattened sequences (900 tokens).
+    Target uses -100 (IGNORE_LABEL) for positions we don't evaluate (PAD).
     
     Args:
-        prediction: [S] predicted tokens at each position
-        target: [S] target tokens (-100 for ignored positions, 4-13 for colors)
+        prediction: [900] predicted tokens at each position
+        target: [900] target tokens (-100 for ignored positions, 4-13 for colors)
         
     Returns:
-        [H, W] grid with values 0-9
+        [H, W] grid with values 0-9 (cropped to actual content)
     """
-    rows = []
-    current_row = []
+    # Reshape to 30x30
+    pred_2d = prediction.reshape(MAX_GRID_SIZE, MAX_GRID_SIZE)
+    target_2d = target.reshape(MAX_GRID_SIZE, MAX_GRID_SIZE)
     
-    for i in range(len(target)):
-        token = target[i]
-        
-        if token == -100 or token == PAD_TOKEN:
-            # This is an ignored position (EOS, PAD, or role marker)
-            if current_row:  # End of a row
-                rows.append(current_row)
-                current_row = []
-        elif token == EOS_TOKEN:
-            # Explicit EOS token
-            if current_row:
-                rows.append(current_row)
-                current_row = []
-        elif token == INPUT_MARKER or token == OUTPUT_MARKER:
-            # Skip role markers
-            continue
-        else:
-            # Valid color token - get prediction at this position
-            pred_token = prediction[i]
-            # Convert to color (0-9)
-            if pred_token >= COLOR_OFFSET:
-                color = pred_token - COLOR_OFFSET
-            else:
-                color = max(0, pred_token)
-            color = int(max(0, min(9, color)))
-            current_row.append(color)
+    # Find bounding box of valid content (where target != -100 and target != PAD)
+    valid_mask = (target_2d != -100) & (target_2d != PAD_TOKEN) & (target_2d != EOS_TOKEN)
     
-    if current_row:
-        rows.append(current_row)
-    
-    if not rows:
+    if not valid_mask.any():
         return np.zeros((1, 1), dtype=np.uint8)
     
-    max_width = max(len(row) for row in rows)
-    grid = np.zeros((len(rows), max_width), dtype=np.uint8)
-    for i, row in enumerate(rows):
-        grid[i, :len(row)] = row
+    # Get bounding box
+    rows = np.any(valid_mask, axis=1)
+    cols = np.any(valid_mask, axis=0)
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
     
-    return grid
+    # Extract prediction grid for valid region
+    pred_crop = pred_2d[rmin:rmax+1, cmin:cmax+1].copy()
+    
+    # Convert tokens to colors (0-9)
+    # Prediction tokens: PAD=0, EOS=1, INPUT=2, OUTPUT=3, colors 4-13
+    grid = np.zeros_like(pred_crop, dtype=np.uint8)
+    for r in range(pred_crop.shape[0]):
+        for c in range(pred_crop.shape[1]):
+            token = pred_crop[r, c]
+            if token >= COLOR_OFFSET:
+                grid[r, c] = token - COLOR_OFFSET
+            else:
+                grid[r, c] = 0  # Treat special tokens as black
+    
+    return np.clip(grid, 0, 9)
 
 
 def target_to_grid(target: np.ndarray) -> np.ndarray:
     """
-    Convert target sequence to grid, handling -100 (IGNORE_LABEL) for EOS/PAD/role markers.
+    Convert target sequence to grid using TRM-style aligned format.
     
-    The target has color tokens (4-13) and -100 for ignored positions (EOS, PAD, role markers).
-    -100 at row boundaries acts as the EOS marker.
+    The target is a 30x30 flattened sequence (900 tokens).
+    -100 marks padding positions (IGNORE_LABEL).
     
     Args:
-        target: [S] target tokens (-100 for ignored positions, 4-13 for colors)
+        target: [900] target tokens (-100 for ignored positions, 4-13 for colors)
         
     Returns:
-        [H, W] grid with values 0-9
+        [H, W] grid with values 0-9 (cropped to actual content)
     """
-    rows = []
-    current_row = []
+    # Reshape to 30x30
+    target_2d = target.reshape(MAX_GRID_SIZE, MAX_GRID_SIZE)
     
-    for token in target:
-        if token == -100 or token == PAD_TOKEN:
-            # End of row or padding
-            if current_row:
-                rows.append(current_row)
-                current_row = []
-        elif token == EOS_TOKEN:
-            # Explicit EOS
-            if current_row:
-                rows.append(current_row)
-                current_row = []
-        elif token == INPUT_MARKER or token == OUTPUT_MARKER:
-            # Skip role markers
-            continue
-        else:
-            # Color token (4-13 → 0-9)
-            color = token - COLOR_OFFSET
-            color = int(max(0, min(9, color)))
-            current_row.append(color)
+    # Find bounding box of valid content (where target != -100 and target is a color)
+    valid_mask = (target_2d != -100) & (target_2d >= COLOR_OFFSET)
     
-    if current_row:
-        rows.append(current_row)
-    
-    if not rows:
+    if not valid_mask.any():
         return np.zeros((1, 1), dtype=np.uint8)
     
-    max_width = max(len(row) for row in rows)
-    grid = np.zeros((len(rows), max_width), dtype=np.uint8)
-    for i, row in enumerate(rows):
-        grid[i, :len(row)] = row
+    # Get bounding box
+    rows = np.any(valid_mask, axis=1)
+    cols = np.any(valid_mask, axis=0)
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
     
-    return grid
+    # Extract target grid for valid region
+    target_crop = target_2d[rmin:rmax+1, cmin:cmax+1].copy()
+    
+    # Convert tokens to colors (0-9)
+    grid = np.zeros_like(target_crop, dtype=np.uint8)
+    for r in range(target_crop.shape[0]):
+        for c in range(target_crop.shape[1]):
+            token = target_crop[r, c]
+            if token >= COLOR_OFFSET:
+                grid[r, c] = token - COLOR_OFFSET
+            elif token == -100:
+                grid[r, c] = 0  # Shouldn't happen in cropped region
+            else:
+                grid[r, c] = 0  # EOS or special token
+    
+    return np.clip(grid, 0, 9)
+
+
+def sequence_to_grid(seq: np.ndarray) -> np.ndarray:
+    """
+    Convert a sequence to a grid using TRM-style aligned format.
+    
+    The sequence is a 30x30 flattened grid (900 tokens).
+    
+    Args:
+        seq: [900] sequence with PAD=0, EOS=1, colors 4-13
+        
+    Returns:
+        [H, W] grid with values 0-9 (cropped to actual content)
+    """
+    # Reshape to 30x30
+    seq_2d = seq.reshape(MAX_GRID_SIZE, MAX_GRID_SIZE)
+    
+    # Find bounding box of content (where seq is a color token, not PAD or EOS)
+    content_mask = seq_2d >= COLOR_OFFSET
+    
+    if not content_mask.any():
+        return np.zeros((1, 1), dtype=np.uint8)
+    
+    # Get bounding box
+    rows = np.any(content_mask, axis=1)
+    cols = np.any(content_mask, axis=0)
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+    
+    # Extract grid for content region
+    seq_crop = seq_2d[rmin:rmax+1, cmin:cmax+1].copy()
+    
+    # Convert tokens to colors (0-9)
+    grid = np.zeros_like(seq_crop, dtype=np.uint8)
+    for r in range(seq_crop.shape[0]):
+        for c in range(seq_crop.shape[1]):
+            token = seq_crop[r, c]
+            if token >= COLOR_OFFSET:
+                grid[r, c] = token - COLOR_OFFSET
+            else:
+                grid[r, c] = 0
+    
+    return np.clip(grid, 0, 9)
 
 
 def create_sample_image(
@@ -753,6 +782,8 @@ def train_epoch(
                 writer.add_scalar('Loss/diversity', metrics['loss_diversity'], global_step)
             if metrics.get('loss_gate_polar', 0) > 0:
                 writer.add_scalar('Loss/gate_polarization', metrics['loss_gate_polar'], global_step)
+            if metrics.get('loss_gate_sparsity', 0) > 0:
+                writer.add_scalar('Loss/gate_sparsity', metrics['loss_gate_sparsity'], global_step)
 
             # === Component Losses ===
             if metrics.get('loss_q_head', 0) > 0:
