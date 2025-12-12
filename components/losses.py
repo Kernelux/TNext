@@ -145,30 +145,6 @@ def compute_read_gate_sparsity_loss(
     return total_loss
 
 
-def compute_diversity_loss(slot_counts_list: list) -> torch.Tensor:
-    """
-    Slot Diversity Loss (Section 9.3 - Solution A):
-    L_diversity = -λ_D · H(1/T · Σ_t slot_probs_t)
-
-    Encourages uniform slot usage across the sequence.
-    """
-    if not slot_counts_list:
-        return torch.tensor(0.0)
-
-    # Aggregate slot counts across all layers
-    total_counts = torch.stack(slot_counts_list).sum(dim=0)  # [B, K]
-
-    # Normalize to distribution
-    total_counts = total_counts + 1e-8
-    probs = total_counts / total_counts.sum(dim=-1, keepdim=True)
-
-    # Entropy (higher = more uniform = better)
-    entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
-
-    # We want to maximize entropy, so return negative
-    return -entropy
-
-
 def compute_output_entropy_loss(logits: torch.Tensor, test_output: torch.Tensor) -> torch.Tensor:
     """
     Output Entropy Regularization - prevents mode collapse.
@@ -413,58 +389,226 @@ def compute_adaptive_ponder_cost(
     
     return ponder_cost.clamp(0, 1)
 
-
-def compute_halt_prediction_loss(
+def compute_q_halt_loss(
     aux_info: Dict,
     test_output: torch.Tensor,
-) -> torch.Tensor:
+    ignore_label: int = -100,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    Halt Prediction Loss (Q-learning style) - train halt decision to predict correctness.
+    Q-Halt Loss (TRM-inspired) - trains the halt head to predict sequence correctness.
     
-    TRM uses a Q-head that predicts "should I halt?" with BCE against actual correctness.
-    We use our confidence as the halt signal, so we train confidence to predict correctness.
+    Key insight from TRM: The halt decision should be trained with supervision!
+    - During training, we KNOW if the answer is correct
+    - Train q_halt to output: >0 if correct, <0 if wrong
+    - Loss: BCE(sigmoid(q_halt), seq_is_correct)
     
-    This is similar to confidence calibration but focuses on the DECISION:
-    - If we halted (or would halt) at this pass, was it correct?
-    - Train halt threshold to say "halt" when answer is correct
+    This is much smarter than entropy-based halting because:
+    1. High confidence ≠ correct answer (model can be confidently wrong)
+    2. Direct supervision: correctness is the actual signal we care about
+    3. Learns to recognize "what does a wrong answer look like?"
     
-    The key difference from calibration:
-    - Calibration: confidence ≈ correctness (soft matching)
-    - Halt prediction: halt_decision ≈ full_sequence_correct (binary task)
+    Args:
+        aux_info: Dict containing 'q_halt_logits_list' and 'pass_logits'
+        test_output: [B, S] ground truth tokens
+        ignore_label: Token to ignore in correctness computation
+        
+    Returns:
+        q_halt_loss: Scalar loss (BCE against correctness)
+        metrics: Dict with debugging info (q_halt_accuracy, etc.)
     """
     device = test_output.device
     
-    pass_confidences = aux_info.get('pass_confidences', [])
+    q_halt_logits_list = aux_info.get('q_halt_logits_list', [])
     pass_logits = aux_info.get('pass_logits', [])
     
-    if not pass_confidences or not pass_logits:
-        return torch.tensor(0.0, device=device)
+    if not q_halt_logits_list or not pass_logits:
+        return torch.tensor(0.0, device=device), {'q_halt_accuracy': 0.0, 'n_passes_with_q_halt': 0}
+    
+    # Ensure we have same number of q_halt logits as pass logits
+    n_passes = min(len(q_halt_logits_list), len(pass_logits))
+    if n_passes == 0:
+        return torch.tensor(0.0, device=device), {'q_halt_accuracy': 0.0, 'n_passes_with_q_halt': 0}
     
     total_loss = torch.tensor(0.0, device=device)
-    valid_mask = (test_output != IGNORE_LABEL)
+    total_q_halt_accuracy = 0.0
+    valid_passes = 0
+    valid_mask = (test_output != ignore_label)  # [B, S]
     
-    for i, (conf, logits) in enumerate(zip(pass_confidences, pass_logits)):
+    for i in range(n_passes):
+        q_halt = q_halt_logits_list[i]  # [B] - raw logits
+        logits = pass_logits[i]  # [B, S, V]
+        
+        # Skip if inputs contain NaN
+        if torch.isnan(q_halt).any() or torch.isnan(logits).any():
+            continue
+        
         # Compute sequence-level correctness at this pass
         predictions = logits.argmax(dim=-1)  # [B, S]
         correct_positions = (predictions == test_output) | ~valid_mask  # [B, S]
-        seq_correct = correct_positions.all(dim=-1).float()  # [B] - 1 if all correct
+        seq_correct = correct_positions.all(dim=-1).float()  # [B] - 1 if all correct, 0 otherwise
         
-        # Confidence should predict sequence correctness
-        # Use mean confidence as "would halt" decision
-        conf_mean = conf.mean(dim=-1) if conf.dim() > 1 else conf  # [B]
-        
-        # BCE loss: confidence should match correctness
-        loss = F.binary_cross_entropy(
-            conf_mean.clamp(0.01, 0.99),
-            seq_correct.detach(),
+        # BCE loss: train q_halt to predict correctness
+        # q_halt > 0 should mean "answer is correct" (halt)
+        # q_halt < 0 should mean "answer is wrong" (continue)
+        # Use safe normalization: log_sigmoid for numerical stability
+        q_halt_safe = q_halt.clamp(min=-15.0, max=15.0)  # Tighter clamp for stability
+        loss = F.binary_cross_entropy_with_logits(
+            q_halt_safe,
+            seq_correct,
             reduction='mean'
         )
         
-        # Weight later passes more (more important to get halt right at the end)
-        weight = (i + 1) / len(pass_confidences)
-        total_loss = total_loss + weight * loss
+        # Check for NaN and skip if present
+        if torch.isnan(loss) or torch.isinf(loss):
+            continue
+            
+        total_loss = total_loss + loss
+        valid_passes += 1
+        
+        # Track accuracy of halt prediction
+        with torch.no_grad():
+            halt_decision = (q_halt > 0).float()
+            q_halt_correct = (halt_decision == seq_correct).float().mean().item()
+            total_q_halt_accuracy += q_halt_correct
     
-    return total_loss / len(pass_confidences)
+    # Average over valid passes (with epsilon to avoid division by zero)
+    if valid_passes > 0:
+        avg_loss = total_loss / valid_passes
+        avg_accuracy = total_q_halt_accuracy / valid_passes
+    else:
+        avg_loss = torch.tensor(0.0, device=device)
+        avg_accuracy = 0.0
+    
+    metrics = {
+        'q_halt_accuracy': avg_accuracy,
+        'n_passes_with_q_halt': valid_passes,
+    }
+    
+    return avg_loss, metrics
+
+
+def compute_model_info_gain_loss(
+    aux_info: Dict,
+    maximize: bool = True,
+    decay: float = 0.7,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Model-Level Info Gain Loss - encourages productive passes.
+    
+    At model level, we have actual logits so info_gain = entropy reduction
+    between consecutive passes. This is a direct measure of progress.
+    
+    Combined with Q-halt, this enables smart halting:
+    - q_halt > 0 (thinks correct) → halt
+    - q_halt < 0 + high info_gain → continue (making progress)
+    - q_halt < 0 + low info_gain → abort (stuck, wasting compute)
+    
+    Args:
+        aux_info: Contains 'pass_info_gains' list of scalars
+        maximize: If True, maximize info gain (loss = -info_gain)
+        decay: Weight decay for later passes (earlier passes matter more)
+    
+    Returns:
+        loss: Scalar loss (negative if maximizing = reward for high info gain)
+        metrics: Dict with info gain stats
+    """
+    pass_info_gains = aux_info.get('pass_info_gains', [])
+    
+    # Guard: return early if empty or None
+    if not pass_info_gains or len(pass_info_gains) == 0:
+        return torch.tensor(0.0), {'avg_model_info_gain': 0.0, 'num_passes_with_info_gain': 0}
+    
+    # Get device from first valid info gain tensor
+    device = 'cpu'
+    for ig in pass_info_gains:
+        if isinstance(ig, torch.Tensor) and ig.numel() > 0:
+            device = ig.device
+            break
+    
+    total_loss = torch.tensor(0.0, device=device)
+    total_info_gain = 0.0
+    valid_count = 0
+    weight_sum = 0.0
+    
+    for i, info_gain in enumerate(pass_info_gains):
+        # Convert to tensor if needed
+        if not isinstance(info_gain, torch.Tensor):
+            ig_tensor = torch.tensor(float(info_gain), device=device)
+        else:
+            ig_tensor = info_gain
+        
+        # Skip NaN/Inf values
+        if torch.isnan(ig_tensor).any() or torch.isinf(ig_tensor).any():
+            continue
+        
+        # Weight: earlier passes should contribute more
+        weight = decay ** i  # 1.0, 0.7, 0.49, ...
+        weight_sum += weight
+        
+        if maximize:
+            # Maximize info gain: loss = -info_gain
+            # Use abs() to encourage large entropy changes in either direction
+            total_loss = total_loss - weight * ig_tensor.abs()
+        
+        # Detach for logging to avoid warning about .item() on gradient tensor
+        ig_val = ig_tensor.detach().abs().item() if isinstance(ig_tensor, torch.Tensor) else abs(info_gain)
+        total_info_gain += ig_val
+        valid_count += 1
+    
+    # Normalize by weighted sum (not just count) for proper decay normalization
+    if valid_count > 0 and weight_sum > 1e-8:
+        total_loss = total_loss / weight_sum
+        avg_info_gain = total_info_gain / valid_count
+    else:
+        avg_info_gain = 0.0
+    
+    metrics = {
+        'avg_model_info_gain': avg_info_gain,
+        'num_passes_with_info_gain': valid_count,
+    }
+    
+    return total_loss, metrics
+
+
+def should_abort_refinement(
+    q_halt_logits: torch.Tensor,  # [B] - Q-halt prediction
+    info_gain: float,              # Current info gain
+    info_gain_threshold: float = 0.01,  # Min info gain to continue
+) -> torch.Tensor:
+    """
+    Combined halt decision: Q-halt + Info Gain.
+    
+    Logic:
+    - q_halt > 0 (thinks correct) → halt (True)
+    - q_halt < 0 + info_gain >= threshold → continue (False) 
+    - q_halt < 0 + info_gain < threshold → abort (True) - stuck!
+    
+    This prevents wasting compute when:
+    1. Answer seems wrong AND
+    2. We're not making progress
+    
+    Args:
+        q_halt_logits: [B] Q-halt logits (>0 = halt)
+        info_gain: Scalar info gain for this pass
+        info_gain_threshold: Minimum info gain to justify continuing
+    
+    Returns:
+        should_halt: [B] boolean tensor
+    """
+    # Q-halt decision: >0 means halt
+    q_halt_says_halt = q_halt_logits > 0  # [B]
+    
+    # Info gain decision: low info gain = abort
+    low_info_gain = info_gain < info_gain_threshold
+    
+    # Combined: halt if q_halt says so, OR if wrong + stuck
+    # q_halt < 0 means "thinks wrong", combined with low info gain = abort
+    q_halt_says_wrong = q_halt_logits < 0  # [B]
+    stuck_and_wrong = q_halt_says_wrong & low_info_gain  # [B] (broadcasts scalar)
+    
+    should_halt = q_halt_says_halt | stuck_and_wrong
+    
+    return should_halt
 
 
 def compute_early_exit_bonus(
@@ -595,6 +739,182 @@ def compute_threshold_supervision_loss(
     return total_loss
 
 
+def compute_layer_divergence_loss(
+    aux_info: Dict,
+    min_divergence: float = 0.1,
+    divergence_decay: float = 0.5,
+    maximize_info_gain: bool = True,
+) -> torch.Tensor:
+    """
+    Layer Divergence Loss - encourages meaningful representation change between iterations.
+    
+    Problem: Transformer layers with residual connections naturally produce outputs
+    very similar to inputs (high cosine similarity). This causes the layer halt
+    estimator to trigger immediately (stability > threshold after 1 iteration).
+    
+    Solution: Two complementary signals:
+    
+    1. **Cosine Divergence**: Penalize when cos_dist = 1 - cos_sim is too low
+       - Early iterations MUST change the representation geometrically
+       - Penalty: ReLU(min_divergence - cos_dist)^2
+    
+    2. **Information Gain Maximization**: Directly maximize |entropy_change|
+       - Each iteration should produce maximum information change
+       - Loss: -|info_gain| (negative = maximize)
+       - This encourages productive iterations without arbitrary thresholds
+    
+    3. **Iteration Decay**: Divergence requirement decreases with iteration count
+       - Iteration 0→1: full requirement
+       - Iteration 1→2: requirement * decay
+       - Later: can settle
+    
+    Args:
+        aux_info: Contains:
+            - 'layer_stabilities': [B] cosine similarities (from LayerHaltEstimator)
+            - 'layer_info_gains': [B] entropy changes (from layer)
+        min_divergence: Minimum cos_dist for first iteration
+        divergence_decay: Reduce requirement by this factor per iteration
+        maximize_info_gain: If True, maximize info gain directly instead of threshold
+    
+    Returns:
+        Scalar loss (can be negative when maximizing info gain)
+    """
+    device = None
+    total_loss = torch.tensor(0.0)
+    weight_sum_stability = 0.0
+    weight_sum_info = 0.0
+    
+    # === Part 1: Cosine Divergence (stability-based) ===
+    layer_stabilities = aux_info.get('layer_stabilities', [])
+    if not layer_stabilities:
+        layer_stabilities = aux_info.get('layer_confidences', [])
+    
+    for i, stability in enumerate(layer_stabilities):
+        if stability is None:
+            continue
+        
+        if device is None and isinstance(stability, torch.Tensor):
+            device = stability.device
+            total_loss = total_loss.to(device)
+        
+        # Skip NaN/Inf
+        if isinstance(stability, torch.Tensor) and (torch.isnan(stability).any() or torch.isinf(stability).any()):
+            continue
+        
+        # Divergence = 1 - stability (cosine distance)
+        if isinstance(stability, torch.Tensor):
+            divergence = 1.0 - stability.clamp(0, 1)  # Ensure stability is in [0,1]
+        else:
+            divergence = torch.tensor(max(0.0, 1.0 - float(stability)), device=device)
+        
+        # Decaying requirement with weight
+        weight = divergence_decay ** i  # 1.0, 0.5, 0.25, ...
+        required_divergence = min_divergence * weight
+        deficit = F.relu(required_divergence - divergence)
+        total_loss = total_loss + weight * (deficit ** 2).mean()
+        weight_sum_stability += weight
+    
+    # === Part 2: Information Gain ===
+    layer_info_gains = aux_info.get('layer_info_gains', [])
+    
+    for i, info_gain in enumerate(layer_info_gains):
+        if info_gain is None:
+            continue
+        
+        if device is None and isinstance(info_gain, torch.Tensor):
+            device = info_gain.device
+            total_loss = total_loss.to(device)
+        
+        # Skip NaN/Inf
+        if isinstance(info_gain, torch.Tensor) and (torch.isnan(info_gain).any() or torch.isinf(info_gain).any()):
+            continue
+        
+        if isinstance(info_gain, torch.Tensor):
+            abs_info_gain = info_gain.abs().clamp(max=10.0)  # Clamp to prevent explosion
+        else:
+            abs_info_gain = torch.tensor(min(abs(float(info_gain)), 10.0), device=device)
+        
+        # Weight: earlier iterations should contribute more
+        weight = divergence_decay ** i  # 1.0, 0.5, 0.25, ...
+        
+        if maximize_info_gain:
+            # Maximize info gain: loss = -|info_gain|
+            total_loss = total_loss - weight * abs_info_gain.mean()
+        else:
+            # Old behavior: penalize below threshold
+            min_info_gain = 0.01
+            required_info_gain = min_info_gain * weight
+            info_deficit = F.relu(required_info_gain - abs_info_gain)
+            total_loss = total_loss + weight * (info_deficit ** 2).mean()
+        
+        weight_sum_info += weight
+    
+    # Normalize by total weight sum (not count) for proper weighting
+    total_weight = weight_sum_stability + weight_sum_info
+    if total_weight > 1e-8:
+        total_loss = total_loss / total_weight
+    
+    return total_loss
+
+
+def compute_representation_entropy_change_loss(
+    aux_info: Dict,
+    min_entropy_change: float = 0.05,
+) -> torch.Tensor:
+    """
+    Representation Entropy Change Loss - ensures iterations produce information change.
+    
+    Measures the entropy of the hidden state's activation distribution and
+    penalizes when it doesn't change between iterations.
+    
+    Why entropy? If a layer iteration doesn't change the "shape" of activations,
+    it's not doing meaningful computation. Entropy captures this distribution change.
+    
+    Entropy of hidden state h: H(h) = -sum(p * log(p)) where p = softmax(h, dim=-1)
+    
+    Args:
+        aux_info: Contains 'all_layer_outputs' or similar
+        min_entropy_change: Minimum expected entropy change between iterations
+    
+    Returns:
+        Scalar loss penalizing stagnant entropy
+    """
+    # Get layer outputs across iterations
+    all_outputs = aux_info.get('all_layer_outputs', [])
+    
+    if len(all_outputs) < 2:
+        return torch.tensor(0.0)
+    
+    device = all_outputs[0].device
+    total_loss = torch.tensor(0.0, device=device)
+    num_pairs = 0
+    
+    for i in range(len(all_outputs) - 1):
+        h_curr = all_outputs[i]      # [B, S, D]
+        h_next = all_outputs[i + 1]  # [B, S, D]
+        
+        # Compute entropy of activation distribution
+        # Treat hidden dim as "classes" and compute entropy per position
+        p_curr = F.softmax(h_curr, dim=-1)  # [B, S, D]
+        p_next = F.softmax(h_next, dim=-1)  # [B, S, D]
+        
+        entropy_curr = -(p_curr * torch.log(p_curr + 1e-8)).sum(dim=-1)  # [B, S]
+        entropy_next = -(p_next * torch.log(p_next + 1e-8)).sum(dim=-1)  # [B, S]
+        
+        # Entropy change (absolute value - we care about change, not direction)
+        entropy_change = (entropy_next - entropy_curr).abs().mean()  # Scalar
+        
+        # Penalize if change is too small
+        deficit = F.relu(min_entropy_change - entropy_change)
+        total_loss = total_loss + deficit ** 2
+        num_pairs += 1
+    
+    if num_pairs > 0:
+        total_loss = total_loss / num_pairs
+    
+    return total_loss
+
+
 def compute_memory_threshold_regularization(
     model,
     aux_info: Dict,
@@ -668,242 +988,105 @@ def compute_task_loss(
     test_output: torch.Tensor,
     pass_logits_list: List[torch.Tensor],
     vocab_size: int = VOCAB_SIZE,
-) -> torch.Tensor:
+    l1_weight: float = 0.5,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    Compute task loss: standard sequence cross-entropy.
+    Compute task loss: cross-entropy + Smooth L1 distance.
     
-    Simplified for sequence format:
-    - logits: [B, S, vocab_size]
-    - test_output: [B, S] with IGNORE_LABEL (-100) for padding
+    Two components:
+    1. Per-cell cross-entropy (standard, for classification)
+    2. Smooth L1 distance between softmax probs and one-hot targets
     
-    Supports deep supervision via pass_logits_list.
-    Class-balanced weights prevent mode collapse to dominant tokens.
+    Why Smooth L1 helps over L2:
+    - L2 squares small errors → tiny gradients for small mistakes
+    - L1/Smooth L1 gives linear gradient even for small errors
+    - Smooth L1 is less sensitive to outliers than pure L1
+    - Provides consistent gradient signal throughout training
+    
+    Smooth L1: 0.5*x^2 if |x|<1 else |x|-0.5
+    
+    Args:
+        logits: [B, S, vocab_size]
+        test_output: [B, S] with IGNORE_LABEL (-100) for padding
+        pass_logits_list: List of logits from each pass (for deep supervision)
+        vocab_size: Number of output classes
+        l1_weight: Weight for Smooth L1 component (default 0.5)
+    
+    Returns:
+        total_loss: Combined CE + Smooth L1
+        metrics: Dict with ce_loss, l1_loss for logging
     """
     device = logits.device
     
-    # NaN protection - if logits are NaN, return a large but finite loss
+    # NaN protection
     if torch.isnan(logits).any():
-        return torch.tensor(10.0, device=device, requires_grad=True)
+        return torch.tensor(10.0, device=device, requires_grad=True), {
+            'task_ce': 10.0, 'task_l1': 1.0
+        }
     
-    # If using deep supervision, average loss across all passes
-    logits_to_process = pass_logits_list if pass_logits_list else [logits]
+    # Filter out any None or NaN logits from pass_logits_list
+    valid_logits_list = []
+    if pass_logits_list:
+        for p_logits in pass_logits_list:
+            if p_logits is not None and not torch.isnan(p_logits).any():
+                valid_logits_list.append(p_logits)
     
-    # Compute class weights for this batch (inverse frequency)
+    logits_to_process = valid_logits_list if valid_logits_list else [logits]
+    n_passes = len(logits_to_process)
+    
+    if n_passes == 0:
+        return torch.tensor(10.0, device=device, requires_grad=True), {
+            'task_ce': 10.0, 'task_l1': 1.0
+        }
+    
     class_weights = compute_class_weights(test_output, vocab_size, IGNORE_LABEL)
     
-    total_loss = torch.tensor(0.0, device=device)
+    ce_loss = torch.tensor(0.0, device=device)
+    l1_loss = torch.tensor(0.0, device=device)
     
     for p_logits in logits_to_process:
-        # Flatten for cross-entropy: [B*S, vocab_size] and [B*S]
+        # === 1. Standard Cross-Entropy ===
+        # Use log_softmax for numerical stability instead of raw logits
+        log_probs = F.log_softmax(p_logits, dim=-1)  # [B, S, V]
         logits_flat = p_logits.reshape(-1, vocab_size)
         targets_flat = test_output.reshape(-1)
         
-        # Use ignore_index=-100 to skip padded positions
-        # Class weights prevent collapse to dominant token
-        # LABEL SMOOTHING (0.1) prevents softmax saturation and keeps gradients flowing
-        total_loss = total_loss + F.cross_entropy(
+        ce_loss = ce_loss + F.cross_entropy(
             logits_flat, targets_flat, 
             weight=class_weights,
             ignore_index=IGNORE_LABEL,
-            label_smoothing=0.1  # Key fix for gradient flow!
+            label_smoothing=0.1
         )
-
-    color_loss = total_loss / len(logits_to_process)
-    
-    return color_loss
-
-def compute_q_head_loss(
-    aux_info: Dict,
-    test_output: torch.Tensor,
-    config: TrainingConfig,
-    device: torch.device
-) -> torch.Tensor:
-    """
-    Q-Head Loss (TRM-style Adaptive Computation Time).
-    
-    Now handles TWO-PHASE architecture:
-    - Reflection phase: Q-head learns when reflection is "complete" (cache is ready)
-    - Answer phase: Q-head learns when answer is "correct" (prediction is good)
-    
-    For reflection phase, we use a heuristic: reflection is "complete" when
-    cache state is sufficiently distinct from initial state (learned implicitly).
-    We don't have ground truth for "when is reflection done", so we train it
-    with a soft target based on pass number (later passes should halt).
-    
-    For answer phase, we use actual correctness against test_output.
-    
-    Now works with sequences: test_output is [B, S] with IGNORE_LABEL for padding.
-    """
-    model_q_loss = torch.tensor(0.0, device=device)
-    features = config.features
-    
-    # no_act_continue: Paper recommends skipping Q_continue loss
-    use_q_continue = not features.no_act_continue
-    
-    # === ANSWER PHASE Q-HEAD LOSS ===
-    # Get answer Q-head outputs (these are LOGITS)
-    q_halt_list = aux_info.get('q_halt', [])
-    q_continue_list = aux_info.get('q_continue', [])
-    
-    if q_halt_list:
-        # Get pass logits for computing per-pass correctness
-        pass_logits = aux_info.get('pass_logits', [])
-        final_logits = aux_info.get('final_logits')
         
-        # If we have per-pass logits (deep supervision), compute per-pass loss
-        if pass_logits:
-            total_loss = torch.tensor(0.0, device=device)
-            for i, (q_h_logit, q_c_logit, p_logits) in enumerate(zip(q_halt_list, q_continue_list, pass_logits)):
-                # Per-pass correctness (only in valid positions, not padding)
-                preds = p_logits.detach().argmax(dim=-1)  # [B, S]
-                valid_mask = (test_output != IGNORE_LABEL)  # [B, S]
-                correct_at_valid = (preds == test_output) | ~valid_mask
-                is_correct = correct_at_valid.all(dim=-1).float()  # [B]
-                
-                # BCE with logits (more numerically stable)
-                loss_halt = F.binary_cross_entropy_with_logits(q_h_logit, is_correct.detach())
-                total_loss = total_loss + loss_halt
-                
-                if use_q_continue:
-                    is_wrong = 1.0 - is_correct
-                    loss_cont = F.binary_cross_entropy_with_logits(q_c_logit, is_wrong.detach())
-                    total_loss = total_loss + loss_cont
-            
-            model_q_loss = model_q_loss + total_loss / len(pass_logits)
-        
-        # Otherwise, use final logits only
-        elif final_logits is not None and q_halt_list:
-            q_halt_final = q_halt_list[-1]
-            
-            preds = final_logits.detach().argmax(dim=-1)  # [B, S]
-            valid_mask = (test_output != IGNORE_LABEL)  # [B, S]
-            correct_at_valid = (preds == test_output) | ~valid_mask
-            is_correct = correct_at_valid.all(dim=-1).float()  # [B]
-            
-            loss_halt = F.binary_cross_entropy_with_logits(q_halt_final, is_correct.detach())
-            model_q_loss = model_q_loss + loss_halt
-            
-            if use_q_continue and q_continue_list:
-                q_continue_final = q_continue_list[-1]
-                is_wrong = 1.0 - is_correct
-                loss_cont = F.binary_cross_entropy_with_logits(q_continue_final, is_wrong.detach())
-                model_q_loss = model_q_loss + loss_cont
-    
-    # === REFLECTION PHASE Q-HEAD LOSS ===
-    # For reflection, we use a soft target: later passes should be more likely to halt
-    # This is a heuristic since we don't know the "true" completion point
-    reflection_q_halt = aux_info.get('reflection_q_halt', [])
-    reflection_q_continue = aux_info.get('reflection_q_continue', [])
-    
-    if reflection_q_halt:
-        num_reflection_passes = len(reflection_q_halt)
-        reflection_loss = torch.tensor(0.0, device=device)
-        
-        for i, (q_h_logit, q_c_logit) in enumerate(zip(reflection_q_halt, reflection_q_continue)):
-            # Soft target: probability of halting increases with pass number
-            # Pass 1: target 0.2, Pass 2: 0.4, Pass 3: 0.6, etc.
-            # This encourages the model to learn when reflection is "enough"
-            halt_target = min(0.8, (i + 1) / num_reflection_passes)
-            batch_size = q_h_logit.shape[0]
-            halt_targets = torch.full((batch_size,), halt_target, device=device)
-            
-            loss_halt = F.binary_cross_entropy_with_logits(q_h_logit, halt_targets)
-            reflection_loss = reflection_loss + loss_halt
-            
-            if use_q_continue:
-                continue_targets = 1.0 - halt_targets
-                loss_cont = F.binary_cross_entropy_with_logits(q_c_logit, continue_targets)
-                reflection_loss = reflection_loss + loss_cont
-        
-        # Weight reflection Q-loss less than answer (answer correctness is more important)
-        model_q_loss = model_q_loss + 0.5 * reflection_loss / num_reflection_passes
-    
-    return model_q_loss
-
-def compute_step_efficiency_loss(
-    logits: torch.Tensor,
-    aux_info: Dict,
-    test_output: torch.Tensor,
-    config: TrainingConfig,
-    model_num_layers: int,
-    device: torch.device
-) -> torch.Tensor:
-    """
-    [LAYER STEP EFFICIENCY - Error * Steps formulation]
-    
-    Penalize steps proportional to error rate:
-    - High error + high steps = worst (wasted computation, still wrong)
-    - High error + low steps = OK (fail fast)
-    - Low error + high steps = better (correct, but inefficient)
-    - Low error + low steps = best (efficient and correct)
-    
-    loss = error_rate * normalized_steps
-    
-    This creates intuitive behavior:
-    - If wrong anyway, at least fail fast
-    - If correct, be as efficient as possible
-    
-    Now works with sequences: test_output and logits are [B, S].
-    """
-    step_efficiency_loss = torch.tensor(0.0, device=device)
-    features = config.features
-
-    if features.use_layer_act and 'expected_steps' in aux_info and aux_info['expected_steps']:
-        # Compute token-level error rate using SOFT probabilities (not detached argmax!)
-        # This allows gradients to flow back through the step_predictor
-        # logits: [B, S, vocab_size], test_output: [B, S]
+        # === 2. Smooth L1: ||softmax(logits) - one_hot(target)|| ===
         valid_mask = (test_output != IGNORE_LABEL)  # [B, S]
+        probs = torch.exp(log_probs)  # Use exp(log_softmax) for numerical stability
         
-        # Use soft cross-entropy per token as error signal (differentiable!)
-        # Lower CE = more confident correct prediction
-        vocab_size = logits.shape[-1]
-        log_probs = F.log_softmax(logits, dim=-1)  # [B, S, V]
+        # One-hot targets (clamp to handle -100)
+        targets_clamped = test_output.clamp(min=0)  # [B, S]
+        one_hot = F.one_hot(targets_clamped, num_classes=vocab_size).float()  # [B, S, V]
         
-        # Gather log-prob of target class at each position
-        # Clamp test_output to valid range for gather (ignore positions get 0 anyway)
-        target_clamped = test_output.clamp(min=0, max=vocab_size-1)  # [B, S]
-        target_log_probs = log_probs.gather(dim=-1, index=target_clamped.unsqueeze(-1)).squeeze(-1)  # [B, S]
-        
-        # Mask invalid positions and compute mean negative log-prob (like cross-entropy)
-        # Higher value = higher error (wrong predictions)
-        masked_nll = -target_log_probs * valid_mask.float()  # [B, S]
-        total_valid = valid_mask.float().sum(dim=-1).clamp(min=1)  # [B]
-        error_signal = masked_nll.sum(dim=-1) / total_valid  # [B] - soft error rate
-        
-        # Normalize error to [0, 1] range (log_probs are negative, so NLL is positive)
-        # Max NLL is ~log(vocab_size) for uniform distribution
-        max_nll = float(torch.log(torch.tensor(vocab_size, dtype=torch.float32)))
-        error_rate = (error_signal / max_nll).clamp(0, 1)  # [B] in [0, 1]
+        # Smooth L1 per position (sum over vocab, then average over valid positions)
+        # smooth_l1_loss expects same shape, so compute element-wise then reduce
+        l1_per_elem = F.smooth_l1_loss(probs, one_hot, reduction='none')  # [B, S, V]
+        l1_per_pos = l1_per_elem.sum(dim=-1)  # [B, S] - sum over vocab
+        l1_per_pos = l1_per_pos * valid_mask.float()
+        num_valid = valid_mask.sum().clamp(min=1)
+        l1_loss = l1_loss + l1_per_pos.sum() / num_valid
 
-        # Collect expected steps across all passes
-        total_expected_steps = torch.zeros_like(error_rate)  # [B]
-        num_passes = len(aux_info['expected_steps'])
-        
-        for es in aux_info['expected_steps']:  # es: [B, num_layers]
-            total_expected_steps += es.sum(dim=1)  # Sum across layers
-        
-        # Normalize by max possible steps
-        max_recurrent_steps = getattr(config, 'max_recurrent_steps', 4)
-        max_total_steps = float(max_recurrent_steps * model_num_layers * num_passes)
-        normalized_steps = total_expected_steps / (max_total_steps + 1e-8)  # [B] in [0, 1]
-        
-        # Core formulation: error * steps
-        # High error + high steps = high loss (wasted computation)
-        # Low error + low steps = low loss (efficient success)
-        # BOTH error_rate and normalized_steps now have gradients!
-        per_sample_loss = error_rate.detach() * normalized_steps  # error is target, steps learn from it
-        
-        # Also add small direct penalty on steps to encourage efficiency even when correct
-        # This gives step_predictor gradient even when error is 0
-        step_penalty = 0.1 * normalized_steps.mean()
-        
-        # Average across batch
-        step_efficiency_loss = per_sample_loss.mean() + step_penalty
-        
-        # Clamp for safety
-        step_efficiency_loss = step_efficiency_loss.clamp(min=0.0, max=2.0)
-
-    return step_efficiency_loss
+    # Normalize by number of passes
+    ce_loss = ce_loss / n_passes
+    l1_loss = l1_loss / n_passes
+    
+    # Combine: CE for classification + Smooth L1 for consistent gradient
+    total_loss = ce_loss + l1_weight * l1_loss
+    
+    metrics = {
+        'task_ce': ce_loss.detach().item(),
+        'task_l1': l1_loss.detach().item(),
+    }
+    
+    return total_loss, metrics
 
 
 def compute_total_loss(
@@ -932,62 +1115,55 @@ def compute_total_loss(
     """
     features = config.features
     
-    # 1. Task Loss with deep supervision
+    # 1. Task Loss with deep supervision + L2 distance
     if features.use_deep_supervision:
         pass_logits_list = aux_info.get('pass_logits', [logits])
     else:
         pass_logits_list = [logits]
 
-    task_loss = compute_task_loss(
+    task_loss, task_metrics = compute_task_loss(
         logits, test_output, pass_logits_list,
-        model.vocab_size
+        model.vocab_size,
+        l1_weight=0.5,  # Smooth L1 provides consistent gradient signal
     )
 
-    # 2. Confidence Calibration Loss - confidence should match correctness
-    confidence_calibration_loss = compute_confidence_calibration_loss(
-        aux_info, test_output, model.vocab_size
-    )
+    # 2. Q-Halt Loss (TRM-style) - train halt head to predict correctness
+    # This is the main halting loss - trains q_halt to output >0 when correct
+    q_halt_loss, q_halt_metrics = compute_q_halt_loss(aux_info, test_output)
 
-    # 3. Halt Prediction Loss (Q-learning style) - train halt to predict correctness
-    halt_prediction_loss = compute_halt_prediction_loss(aux_info, test_output)
-
-    # 4. Confidence Monotonicity Loss - confidence should increase across passes
-    confidence_monotonicity_loss = compute_confidence_monotonicity_loss(aux_info)
-
-    # 5. Adaptive Ponder Cost - penalize wasteful computation
-    adaptive_ponder_loss = compute_adaptive_ponder_cost(
-        aux_info, test_output, model.max_passes
-    )
-
-    # 6. Early Exit Bonus - reward efficient correct halts (negative loss = reward)
+    # 3. Early Exit Bonus - reward efficient correct halts (negative loss = reward)
     early_exit_bonus = compute_early_exit_bonus(
         aux_info, test_output, model.max_passes
     )
 
-    # 7. Threshold Supervision Loss - provides gradients to halt threshold networks
+    # 4. Threshold Supervision Loss - provides gradients to halt threshold networks
     threshold_supervision_loss = compute_threshold_supervision_loss(
         model, aux_info, test_output, config, device
     )
     
-    # 7b. Memory Threshold Regularization - provides gradients to read/write thresholds
+    # 5. Memory Threshold Regularization - provides gradients to read/write thresholds
     memory_threshold_loss = compute_memory_threshold_regularization(
         model, aux_info, device
     )
-
-    # 8. Legacy Q-Head Loss (for backward compatibility if q_halt/q_continue present)
-    model_q_loss = compute_q_head_loss(aux_info, test_output, config, device)
-
-    # 8. Step Efficiency Loss (layer-level)
-    step_efficiency_loss = compute_step_efficiency_loss(
-        logits, aux_info, test_output, config, model.num_layers, device
+    
+    # 6. Layer Divergence Loss - encourages meaningful iteration (prevents immediate halt)
+    # Now maximizes info gain directly instead of penalizing below threshold
+    layer_divergence_loss = compute_layer_divergence_loss(
+        aux_info,
+        min_divergence=0.1,      # Require at least 10% divergence in first iteration
+        divergence_decay=0.5,    # Halve requirement each subsequent iteration
+        maximize_info_gain=True, # Maximize |entropy_change| between iterations
     )
 
-    # 9. Diversity Loss (slot usage)
-    diversity_loss = torch.tensor(0.0, device=device)
-    if features.use_diversity_loss and 'slot_counts' in aux_info and aux_info['slot_counts']:
-        diversity_loss = compute_diversity_loss(aux_info['slot_counts'])
+    # 7. Model-Level Info Gain Loss - encourages productive passes
+    # Maximizes information gain at model level (logits entropy change)
+    model_info_gain_loss, model_ig_metrics = compute_model_info_gain_loss(
+        aux_info,
+        maximize=True,  # Maximize info gain (negative loss = reward)
+        decay=0.7,      # Earlier passes matter more
+    )
 
-    # 10. Output Entropy Loss - prevents mode collapse
+    # 8. Output Entropy Loss - prevents mode collapse
     output_entropy_loss = compute_output_entropy_loss(logits, test_output)
     
     # 11. Prediction Diversity Loss
@@ -1012,33 +1188,21 @@ def compute_total_loss(
     # === LOSS WEIGHTING ===
     # Use config weights where available, sensible defaults otherwise
     
-    # Confidence-based losses
-    lambda_conf_calib = getattr(config, 'lambda_confidence_calibration', 1.0)  # Increased from 0.5
-    lambda_halt_pred = getattr(config, 'lambda_halt_prediction', 0.3)
-    lambda_conf_mono = getattr(config, 'lambda_confidence_monotonicity', 0.1)
+    # Halting losses
+    lambda_q_halt = getattr(config, 'lambda_q_halt', 1.0)  # TRM-style q_halt loss (primary)
     lambda_threshold = getattr(config, 'lambda_threshold_supervision', 0.2)
-    lambda_ponder = getattr(features, 'lambda_ponder', 0.01)
     
-    confidence_loss = (
-        lambda_conf_calib * confidence_calibration_loss +
-        lambda_halt_pred * halt_prediction_loss +
-        lambda_conf_mono * confidence_monotonicity_loss +
+    halt_loss = (
+        lambda_q_halt * q_halt_loss +  # TRM-style: train q_halt to predict correctness
         lambda_threshold * threshold_supervision_loss +
-        lambda_threshold * memory_threshold_loss +  # Same weight for memory thresholds
-        lambda_ponder * adaptive_ponder_loss +
+        lambda_threshold * memory_threshold_loss +
         early_exit_bonus  # Already scaled internally, can be negative
-    )
-    
-    # Compute efficiency losses
-    compute_loss = (
-        config.lambda_q_head * model_q_loss +
-        config.lambda_step_efficiency * step_efficiency_loss
     )
     
     # Gradient flow losses
     gradient_flow_loss = output_entropy_loss + 0.05 * pred_diversity_loss
     
-    # Gate regularization - use config weights
+    # Gate regularization
     lambda_gate_polar = getattr(config, 'lambda_gate_polar', 0.1)
     lambda_gate_sparsity = getattr(config, 'lambda_gate_sparsity', 0.1)
     lambda_feedback_polar = getattr(config, 'lambda_feedback_polar', 0.1)
@@ -1047,47 +1211,53 @@ def compute_total_loss(
         lambda_gate_sparsity * gate_sparsity_loss +
         lambda_feedback_polar * feedback_polar_loss
     )
+    
+    # Layer divergence loss - encourage iterations to do meaningful work
+    lambda_layer_divergence = getattr(config, 'lambda_layer_divergence', 0.5)
+    divergence_loss = lambda_layer_divergence * layer_divergence_loss
+    
+    # Model-level info gain loss - encourage productive passes
+    lambda_model_info_gain = getattr(config, 'lambda_model_info_gain', 0.3)
+    model_ig_loss = lambda_model_info_gain * model_info_gain_loss
 
     # Total loss
     total_loss = (
         task_loss + 
-        confidence_loss +
-        compute_loss + 
-        config.lambda_diversity * diversity_loss + 
+        halt_loss +
         gradient_flow_loss + 
-        gate_loss
+        gate_loss +
+        divergence_loss +        # Encourage meaningful layer iterations
+        model_ig_loss            # Encourage productive model passes
     )
 
     # NaN protection
     if torch.isnan(total_loss):
         print(f"WARNING: NaN detected in loss! Falling back to task_loss only.")
-        print(f"  task={task_loss.item():.4f}, conf_calib={confidence_calibration_loss:.4f}, "
-              f"halt_pred={halt_prediction_loss:.4f}, ponder={adaptive_ponder_loss:.4f}")
+        print(f"  task={task_loss.item():.4f}, q_halt={q_halt_loss:.4f}")
         total_loss = task_loss
 
     # Metrics for logging
     metrics = {
         'loss_total': total_loss.detach().item(),
         'loss_task': task_loss.detach().item(),
-        # Confidence-based metrics
-        'loss_confidence_calibration': _to_scalar(confidence_calibration_loss),
-        'loss_halt_prediction': _to_scalar(halt_prediction_loss),
-        'loss_confidence_monotonicity': _to_scalar(confidence_monotonicity_loss),
+        'loss_task_ce': task_metrics.get('task_ce', 0.0),
+        'loss_task_l1': task_metrics.get('task_l1', 0.0),
+        # Halting metrics
+        'loss_q_halt': _to_scalar(q_halt_loss),
         'loss_threshold_supervision': _to_scalar(threshold_supervision_loss),
         'loss_memory_threshold': _to_scalar(memory_threshold_loss),
-        'loss_ponder_adaptive': _to_scalar(adaptive_ponder_loss),
         'loss_early_exit_bonus': _to_scalar(early_exit_bonus),
-        # Compute efficiency metrics
-        'loss_compute': _to_scalar(compute_loss),
-        'loss_q_head': _to_scalar(model_q_loss),
-        'loss_step_efficiency': _to_scalar(step_efficiency_loss),
+        'q_halt_accuracy': q_halt_metrics.get('q_halt_accuracy', 0.0),
         # Regularization metrics
-        'loss_diversity': _to_scalar(diversity_loss),
         'loss_output_entropy': _to_scalar(output_entropy_loss),
         'loss_pred_diversity': _to_scalar(pred_diversity_loss),
         'loss_gate_polar': _to_scalar(gate_polar_loss),
         'loss_gate_sparsity': _to_scalar(gate_sparsity_loss),
         'loss_feedback_polar': _to_scalar(feedback_polar_loss),
+        'loss_layer_divergence': _to_scalar(layer_divergence_loss),
+        # Model info gain
+        'loss_model_info_gain': _to_scalar(model_info_gain_loss),
+        'avg_model_info_gain': model_ig_metrics.get('avg_model_info_gain', 0.0),
     }
 
     return total_loss, metrics

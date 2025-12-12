@@ -110,13 +110,21 @@ def gumbel_softmax(logits: torch.Tensor, temperature: float = 1.0, hard: bool = 
     
     During training with high temperature: soft routing (all slots receive updates)
     As temperature → 0: converges to hard one-hot selection
-    """
-    # Clamp logits to prevent numerical issues in softmax
-    logits = logits.clamp(min=-20.0, max=20.0)
     
-    # Sample Gumbel noise
-    gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits).clamp(min=1e-8, max=1.0-1e-8)) + 1e-8)
-    y_soft = F.softmax((logits + gumbel_noise) / max(temperature, 0.01), dim=-1)
+    Uses log-softmax based normalization for numerical stability instead of raw clamping.
+    """
+    # Normalize logits using log_softmax for numerical stability (better than raw clamping)
+    # This centers the logits around 0 and prevents extreme values
+    log_probs = F.log_softmax(logits, dim=-1)  # Numerically stable
+    
+    # Sample Gumbel noise: -log(-log(U)) where U ~ Uniform(0,1)
+    # Use clamping only for the uniform samples to avoid log(0)
+    uniform = torch.rand_like(logits).clamp(min=1e-10, max=1.0 - 1e-10)
+    gumbel_noise = -torch.log(-torch.log(uniform))
+    
+    # Add noise to log_probs (equivalent to adding to normalized logits)
+    # Then apply temperature scaling and softmax
+    y_soft = F.softmax((log_probs + gumbel_noise) / max(temperature, 0.01), dim=-1)
     
     if hard:
         # Straight-through: hard forward, soft backward

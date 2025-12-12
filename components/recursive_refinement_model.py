@@ -28,8 +28,8 @@ import torch.nn.functional as F
 import math
 from typing import Optional, Tuple, Dict, List
 
-from .config import TrainingConfig, FeatureFlags
-from .memory_controller import ConfidenceEstimator
+from .config import TrainingConfig, FeatureFlags, SLOT_DIMS
+from .memory_controller import ModelHaltEstimator
 from .unified_layer import UnifiedMemoryLayer, ComputeBlock  # Import from unified_layer
 from .modules import RotaryEmbedding
 from .dataset import (
@@ -100,10 +100,9 @@ class RecursiveRefinementModel(nn.Module):
         # Segment embedding: context=0 (demos + test_input), answer=1 (test_output)
         self.segment_embed = nn.Embedding(2, d_model)
 
-        # === Slot Metadata Dimensions (must match MemoryController) ===
-        # Metadata: confidence (1) + layer_embed (8) + iter_embed (4) + pass_embed (4) = 17
-        self.d_meta = 17
-        self.d_slot = d_cache + self.d_meta  # Total slot dimension
+        # === Slot Metadata Dimensions (from centralized config) ===
+        self.d_meta = SLOT_DIMS.d_meta
+        self.d_slot = SLOT_DIMS.d_slot(d_cache)
 
         # Learned slot embeddings (concept anchors) - content only
         # Metadata (confidence + temporal) is initialized to zero
@@ -112,22 +111,24 @@ class RecursiveRefinementModel(nn.Module):
         )
 
         # Layer-ID embeddings for representational separation
-        # Used in initial cache to give each layer's slots a distinct identity
-        # Dimension matches d_layer_embed in MemoryController (8)
+        # Dimension from centralized SLOT_DIMS
         self.layer_id_embeddings = nn.Parameter(
-            torch.randn(num_layers, 8) * 0.02  # 8 = d_layer_embed
+            torch.randn(num_layers, SLOT_DIMS.d_layer_embed) * 0.02
         )
 
-        # Shared confidence estimator (created BEFORE layers so it can be shared)
-        # Now includes learned halt thresholds (budget-aware)
-        self.confidence_estimator = ConfidenceEstimator(
+        # === Model-Level Halt Estimator (entropy-based) ===
+        # Separate from per-layer estimators because:
+        # 1. Model-level has access to logits (can use entropy)
+        # 2. Layer-level only has hidden states (uses stability)
+        # 3. Different halting criteria: "is answer confident?" vs "has layer converged?"
+        self.model_halt_estimator = ModelHaltEstimator(
             d_model=d_model,
             vocab_size=vocab_size,
-            max_iterations=max_internal_iterations,
             max_passes=max_passes,
         )
 
         # Unified Memory Layers (imported from unified_layer.py)
+        # Each layer creates its own LayerHaltEstimator internally
         self.layers = nn.ModuleList([
             UnifiedMemoryLayer(
                 d_model=d_model,
@@ -137,16 +138,16 @@ class RecursiveRefinementModel(nn.Module):
                 layer_idx=i,
                 num_heads=num_heads,
                 dropout=dropout,
-                max_write_tokens=64,
+
                 use_linear_attention=True,
                 use_checkpoint=(max_seq_len > 500),  # Enable for large sequences
             )
             for i in range(num_layers)
         ])
 
-        # Share confidence estimator with layers for recursive refinement
-        for layer in self.layers:
-            layer.confidence_estimator = self.confidence_estimator
+        # DEPRECATED: No longer share estimator - each layer has its own
+        # for layer in self.layers:
+        #     layer.confidence_estimator = self.confidence_estimator
 
         # Output projection
         self.output_proj = nn.Linear(d_model, vocab_size)
@@ -154,6 +155,18 @@ class RecursiveRefinementModel(nn.Module):
         # Answer feedback mechanism (TRM insight)
         self.prev_answer_embed = nn.Embedding(vocab_size, d_model)
         self.answer_feedback_gate = nn.Linear(d_model * 2, d_model)
+        
+        # === Pass Embeddings (Model-level iteration awareness) ===
+        # Let the model know which pass it's on (how many times it's seen this input)
+        # This is crucial for the model to know when to refine vs when to commit
+        self.pass_embeddings = nn.Embedding(max_passes, d_model)
+        
+        # === Centralized Temporal Embeddings for Cache Metadata ===
+        # These are shared across all MemoryControllers to ensure consistency
+        # Smaller dimensions than d_model since they're stored in cache slots
+        self.cache_layer_embed = nn.Embedding(num_layers, SLOT_DIMS.d_layer_embed)
+        self.cache_iter_embed = nn.Embedding(max_internal_iterations, SLOT_DIMS.d_iter_embed)
+        self.cache_pass_embed = nn.Embedding(max_passes, SLOT_DIMS.d_pass_embed)
 
         self._init_weights()
 
@@ -177,6 +190,14 @@ class RecursiveRefinementModel(nn.Module):
 
         # Answer feedback gate
         nn.init.xavier_uniform_(self.answer_feedback_gate.weight)
+        
+        # Pass embeddings (small init so pass 0 doesn't dominate)
+        nn.init.normal_(self.pass_embeddings.weight, mean=0.0, std=0.02)
+        
+        # Cache temporal embeddings (shared across all MemoryControllers)
+        nn.init.normal_(self.cache_layer_embed.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.cache_iter_embed.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.cache_pass_embed.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.answer_feedback_gate.bias)
 
     def get_initial_cache(self, batch_size: int, device: torch.device) -> torch.Tensor:
@@ -185,10 +206,7 @@ class RecursiveRefinementModel(nn.Module):
         Cache structure: [content (d_cache) | confidence (1) | temporal (16)]
         - Content: learned slot embeddings
         - Confidence: 0 (empty slots have no confidence)
-        - Temporal: [layer_id (8) | iter (4) | pass (4)]
-          - layer_id: Learned layer identity embedding (gives gradient flow!)
-          - iter: 0 (not yet written by any iteration)
-          - pass: 0 (not yet written by any pass)
+        - Temporal: [layer_id | iter | pass] from SLOT_DIMS
         """
         # Content from learned embeddings
         content = self.slot_embeddings.view(self.total_slots, self.d_cache)  # [L*K, D_cache]
@@ -198,21 +216,20 @@ class RecursiveRefinementModel(nn.Module):
         confidence = torch.zeros(batch_size, self.total_slots, 1, device=device)
         
         # Layer identity embedding: each layer's slots get that layer's embedding
-        # This provides gradient flow to layer_id_embeddings!
-        # Shape: [num_layers, 8] -> expand to [num_layers, num_slots, 8] -> [L*K, 8]
         layer_ids = self.layer_id_embeddings.unsqueeze(1).expand(
             -1, self.num_slots, -1
-        ).reshape(self.total_slots, 8)  # [L*K, 8]
-        layer_ids = layer_ids.unsqueeze(0).expand(batch_size, -1, -1)  # [B, L*K, 8]
+        ).reshape(self.total_slots, SLOT_DIMS.d_layer_embed)
+        layer_ids = layer_ids.unsqueeze(0).expand(batch_size, -1, -1)
         
         # Iteration and pass embeddings: 0 (not yet written)
-        iter_pass = torch.zeros(batch_size, self.total_slots, 8, device=device)  # 4 + 4 = 8
+        iter_pass_dim = SLOT_DIMS.d_iter_embed + SLOT_DIMS.d_pass_embed  # 4 + 4 = 8
+        iter_pass = torch.zeros(batch_size, self.total_slots, iter_pass_dim, device=device)
         
-        # Combine temporal metadata: [layer_id (8) | iter (4) | pass (4)]
-        temporal = torch.cat([layer_ids, iter_pass], dim=-1)  # [B, L*K, 16]
+        # Combine temporal metadata: [layer_id | iter | pass]
+        temporal = torch.cat([layer_ids, iter_pass], dim=-1)  # [B, L*K, d_temporal]
         
-        # Full metadata: [confidence (1) | temporal (16)]
-        metadata = torch.cat([confidence, temporal], dim=-1)  # [B, L*K, 17]
+        # Full metadata: [confidence (1) | temporal]
+        metadata = torch.cat([confidence, temporal], dim=-1)  # [B, L*K, d_meta]
         
         # Combine into full cache
         cache = torch.cat([content, metadata], dim=-1)  # [B, L*K, D_slot]
@@ -242,6 +259,7 @@ class RecursiveRefinementModel(nn.Module):
         config: Optional[TrainingConfig] = None,
         step: int = 0,
         return_aux: bool = True,
+        force_max_passes: bool = False,  # Warmup mode: disable early halting
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
         Multi-pass recursive refinement forward pass.
@@ -331,6 +349,11 @@ class RecursiveRefinementModel(nn.Module):
         current_seq = full_seq
         prev_logits = None
         final_logits = None
+        
+        # === INPUT INJECTION (TRM-style) ===
+        # Save original embedded sequence for re-injection at each pass
+        # This keeps the model grounded to the original input
+        input_embedding = full_seq  # [B, total_seq_len, D_model]
 
         # === MODEL-LEVEL RECURSIVE REFINEMENT LOOP ===
         # Use config.max_passes if provided (for debug scenarios), else model default
@@ -338,6 +361,18 @@ class RecursiveRefinementModel(nn.Module):
         for pass_idx in range(effective_max_passes):
             if return_aux:
                 aux['passes_run'] = pass_idx + 1
+            
+            # === PASS EMBEDDING (iteration awareness) ===
+            # Add pass embedding so model knows which iteration it's on
+            # This helps the model know when to refine vs commit to an answer
+            pass_emb = self.pass_embeddings(torch.tensor(pass_idx, device=device))  # [D_model]
+            current_seq = current_seq + pass_emb.unsqueeze(0).unsqueeze(0)  # [1, 1, D_model] broadcast
+            
+            # === INPUT INJECTION at pass level (TRM-style) ===
+            # Re-inject original input embedding at each pass (after first)
+            # TRM does: hidden_states = hidden_states + input_injection
+            if pass_idx > 0:
+                current_seq = current_seq + input_embedding
 
             # === ANSWER FEEDBACK (TRM-style) ===
             # Inject previous answer as a "hint" for refinement
@@ -364,6 +399,10 @@ class RecursiveRefinementModel(nn.Module):
                 if return_aux:
                     aux['answer_feedback_sum'] += gate.mean().detach().item()
                     aux['answer_feedback_count'] += 1
+                    # Store gate tensor for polarization loss
+                    if 'answer_feedback_gates' not in aux:
+                        aux['answer_feedback_gates'] = []
+                    aux['answer_feedback_gates'].append(gate)
                 
                 # Rebuild current_seq with updated test region (no in-place ops)
                 # This avoids the autograd issue with slice assignment
@@ -378,6 +417,8 @@ class RecursiveRefinementModel(nn.Module):
 
             # Process through recursive layers WITHIN the current pass
             h = current_seq
+            prev_layer_output = None  # For cross-layer skip connection
+            
             for layer_idx, layer in enumerate(self.layers):
                 # Use config.max_recurrent_steps if provided, else model default
                 if features.use_layer_act:
@@ -392,7 +433,18 @@ class RecursiveRefinementModel(nn.Module):
                     max_iterations=max_iterations,
                     confidence_threshold=self.confidence_threshold,
                     pass_idx=pass_idx,  # Pass temporal index for slot metadata
+                    # Centralized temporal embeddings for cache
+                    cache_layer_embed=self.cache_layer_embed,
+                    cache_iter_embed=self.cache_iter_embed,
+                    cache_pass_embed=self.cache_pass_embed,
                 )
+                
+                # === CROSS-LAYER SKIP CONNECTION ===
+                # Add previous layer's output to current layer's output
+                # Creates dense connectivity: layer_0 output contributes to all later layers
+                if prev_layer_output is not None:
+                    h = h + prev_layer_output
+                prev_layer_output = h.detach()  # Detach to avoid double gradient through skip
 
                 if return_aux and layer_aux:
                     iters_run = layer_aux.get('iterations_run', 1)
@@ -418,10 +470,27 @@ class RecursiveRefinementModel(nn.Module):
                         aux['layer_halt_thresholds'] = []
                     if 'layer_confidences' not in aux:
                         aux['layer_confidences'] = []
+                    if 'read_gates' not in aux:
+                        aux['read_gates'] = []
+                    if 'write_gates' not in aux:
+                        aux['write_gates'] = []
+                    if 'layer_stabilities' not in aux:
+                        aux['layer_stabilities'] = []
+                    if 'layer_info_gains' not in aux:
+                        aux['layer_info_gains'] = []
+                    if 'layer_entropies' not in aux:
+                        aux['layer_entropies'] = []
                     aux['read_thresholds'].extend(layer_aux.get('read_thresholds', []))
                     aux['write_thresholds'].extend(layer_aux.get('write_thresholds', []))
                     aux['layer_halt_thresholds'].extend(layer_aux.get('layer_halt_thresholds', []))
                     aux['layer_confidences'].extend(layer_aux.get('layer_confidences', []))
+                    # Layer divergence tracking (for divergence loss)
+                    aux['layer_stabilities'].extend(layer_aux.get('layer_stabilities', []))
+                    aux['layer_info_gains'].extend(layer_aux.get('layer_info_gains', []))
+                    aux['layer_entropies'].extend(layer_aux.get('layer_entropies', []))
+                    # Gate tensors for polarization loss
+                    aux['read_gates'].extend(layer_aux.get('read_gates', []))
+                    aux['write_gates'].extend(layer_aux.get('write_gates', []))
 
             # Extract logits for test output positions
             test_logits = self.output_proj(h[:, test_start_idx:test_start_idx + S])  # [B, S, vocab_size]
@@ -431,52 +500,92 @@ class RecursiveRefinementModel(nn.Module):
             if return_aux and features.use_deep_supervision:
                 aux['pass_logits'].append(test_logits)
 
-            # Confidence assessment for model-level halting
+            # Confidence assessment for model-level halting (Q-halt + entropy)
             if return_aux:
-                # Calculate confidence of current output
-                # ConfidenceEstimator expects [B, S, D] for h and [B, S, V] for logits
                 h_test_region = h[:, test_start_idx:test_start_idx + S]  # [B, S, D_model]
-                current_confidence = self.confidence_estimator(
+                
+                # Use model-level halt estimator (Q-halt + entropy)
+                confidence, q_halt_logits, halt_aux = self.model_halt_estimator(
                     h_test_region,
                     logits=test_logits,
                     prev_logits=prev_logits,
-                )
-                aux['pass_confidences'].append(current_confidence.detach())
-
-                # Get learned halt threshold (budget + confidence aware)
-                # Threshold sees: h_pooled, confidence, pass_ratio, budget_remaining
-                # Low confidence + high budget → higher threshold (keep going)
-                # High confidence OR low budget → lower threshold (halt)
-                halt_threshold = self.confidence_estimator.get_model_halt_threshold(
-                    h_test_region,
-                    confidence=current_confidence,  # No detach - allow gradient flow for learning
                     current_pass=pass_idx,
                     max_pass=self.max_passes,
                 )
-                threshold_val = halt_threshold.mean().detach().item()
-                aux['model_halt_threshold'] = threshold_val  # Scalar for debugging
                 
-                # Store threshold TENSOR (with gradients) for loss computation
-                # This allows threshold network to receive supervision
+                aux['pass_confidences'].append(confidence.detach())
+                
+                # Store Q-halt logits for loss computation (needs gradients!)
+                if 'q_halt_logits_list' not in aux:
+                    aux['q_halt_logits_list'] = []
+                aux['q_halt_logits_list'].append(q_halt_logits)  # Keep gradients!
+                
+                # Track entropy and info_gain from halt_aux
+                if 'pass_entropies' not in aux:
+                    aux['pass_entropies'] = []
+                aux['pass_entropies'].append(halt_aux['entropy'].mean().item())
+                
+                # Store info_gain as TENSOR for gradient flow (maximization loss)
+                if 'pass_info_gains' not in aux:
+                    aux['pass_info_gains'] = []
+                # Keep tensor for loss computation (detach for the halt decision below)
+                aux['pass_info_gains'].append(halt_aux['info_gain'].mean())  # Tensor for loss
+                
+                # Track q_halt values for debugging
+                if 'pass_q_halt' not in aux:
+                    aux['pass_q_halt'] = []
+                aux['pass_q_halt'].append(halt_aux['q_halt_logits'].mean().item())
+
+                # Store legacy threshold for backward compat
+                threshold_val = halt_aux['threshold'].mean().item()
+                aux['model_halt_threshold'] = threshold_val
+                
+                # Store threshold TENSOR for loss computation (legacy)
                 if 'model_halt_thresholds' not in aux:
                     aux['model_halt_thresholds'] = []
-                aux['model_halt_thresholds'].append(halt_threshold)  # [B] with gradients
+                aux['model_halt_thresholds'].append(halt_aux['threshold'])
 
-                # === HALTING DECISION ===
-                # Check if confident enough to halt
-                should_halt = current_confidence.mean() > threshold_val
+                # === HALTING DECISION (Q-halt + Info Gain) ===
+                # Combined logic:
+                # - Pass 0: Never halt based on info_gain (no prev pass to compare)
+                # - q_halt > 0 (thinks correct) → HALT
+                # - q_halt < 0 + high info_gain → CONTINUE (making progress)
+                # - q_halt < 0 + low info_gain → ABORT (stuck, wasting compute)
+                
+                # Use detached value for halt decision (no gradient needed here)
+                info_gain = halt_aux['info_gain'].mean().detach().item()
+                info_gain_threshold = 0.01  # Minimum info gain to justify continuing
+                
+                q_halt_says_halt = q_halt_logits.mean() > 0  # Model thinks answer is correct
+                q_halt_says_wrong = q_halt_logits.mean() < 0  # Model thinks answer is wrong
+                low_info_gain = info_gain < info_gain_threshold
+                
+                # Pass 0 can only halt if q_halt explicitly says correct
+                # Later passes can halt if stuck (wrong + no progress)
+                if pass_idx == 0:
+                    should_halt = q_halt_says_halt
+                else:
+                    should_halt = q_halt_says_halt or (q_halt_says_wrong and low_info_gain)
+                
+                # Track reason for halting
+                if should_halt and q_halt_says_halt:
+                    aux['halt_reason'] = 'q_halt_correct'
+                elif should_halt and low_info_gain:
+                    aux['halt_reason'] = 'stuck_no_progress'
+                
+                # === WARMUP MODE: Skip early halting ===
+                # During warmup, force max passes to let Q-halt learn from diverse pass counts
+                if force_max_passes:
+                    should_halt = False
                 
                 if should_halt:
                     if self.training:
-                        # During training: ε-greedy exploration
-                        # With prob ε, ignore confidence and continue anyway
-                        explore = torch.rand(1, device=device).item() < features.halt_exploration_prob
+                        # ε-greedy exploration during training (30% chance to continue)
+                        explore = torch.rand(1, device=device).item() < 0.3
                         if not explore:
                             aux['halted_early'] = True
-                            break  # Halt: confident and not exploring
-                        # else: continue despite confidence (exploration)
+                            break
                     else:
-                        # During inference: always respect confidence
                         aux['halted_early'] = True
                         break
 
@@ -486,9 +595,11 @@ class RecursiveRefinementModel(nn.Module):
         # Final output and confidence
         if return_aux and final_logits is not None:
             h_test_region = h[:, test_start_idx:test_start_idx + S]
-            final_confidence = self.confidence_estimator(
+            final_confidence, _, _ = self.model_halt_estimator(
                 h_test_region,
                 logits=final_logits,
+                prev_logits=prev_logits,
+                current_pass=aux.get('passes_run', 1) - 1,
             )
             aux['final_confidence'] = final_confidence
             

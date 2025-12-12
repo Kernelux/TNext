@@ -2,6 +2,46 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict
 import math
 
+
+# ============================================================================
+# Slot Dimension Constants
+# ============================================================================
+# Centralized dimensions for cache slot metadata structure.
+# These MUST be consistent across MemoryController, UnifiedMemoryLayer, and RecursiveRefinementModel.
+
+@dataclass(frozen=True)
+class SlotDimensions:
+    """
+    Slot metadata dimensions - frozen to prevent accidental modification.
+    
+    Cache slot structure: [content (d_cache) | confidence (1) | temporal (16)]
+    Temporal breakdown: [layer_id (8) | iter_embed (4) | pass_embed (4)]
+    
+    Total metadata: d_meta = 1 + 8 + 4 + 4 = 17
+    """
+    d_layer_embed: int = 8   # Layer identity embedding dimension
+    d_iter_embed: int = 4    # Iteration embedding dimension  
+    d_pass_embed: int = 4    # Pass embedding dimension
+    
+    @property
+    def d_temporal(self) -> int:
+        """Total temporal embedding dimension."""
+        return self.d_layer_embed + self.d_iter_embed + self.d_pass_embed  # 16
+    
+    @property
+    def d_meta(self) -> int:
+        """Total metadata dimension (confidence + temporal)."""
+        return 1 + self.d_temporal  # 17
+    
+    def d_slot(self, d_cache: int) -> int:
+        """Total slot dimension for a given cache dimension."""
+        return d_cache + self.d_meta
+
+
+# Global instance - use this everywhere instead of hardcoding 17, 8, 4, etc.
+SLOT_DIMS = SlotDimensions()
+
+
 # ============================================================================
 # Feature Flags for Ablation Study
 # ============================================================================
@@ -16,81 +56,52 @@ class FeatureFlags:
     - use_selection_head: Head B for importance scoring and slot routing [Section 2.2]
     - use_multi_pass: Multiple forward passes with cache refinement [Section 2.3]
 
-    IMPROVEMENTS (optional enhancements from spec):
+    IMPROVEMENTS (optional enhancements):
     - use_gumbel_softmax: Differentiable slot selection with annealing [Section 8.2]
     - use_slot_embeddings: Learned concept anchors for cache init [Section 7.7]
-    - use_hybrid_routing: Combined learned + content-based routing [Section 7.8]
     - use_layer_id: Layer-ID embeddings for representational separation [Section 7.6]
-    - use_cache_self_attn: Cache-to-cache attention between passes [Section 10.2]
-    - use_act_halting: Adaptive Computation Time for early stopping [Section 10.1]
+    - use_cache_self_attn: Cache-to-cache attention after writes [Section 10.2]
+    - use_act_halting: Adaptive Computation Time for model-level early stopping [Section 10.1]
+    - use_layer_act: Per-layer ACT iterations
     - use_gated_fusion: Gated combination of input and cache context [Section 3.2]
+    - use_linear_attention: O(S) linear attention instead of O(S²)
 
-    AUXILIARY LOSSES (regularization techniques):
+    AUXILIARY LOSSES:
     - use_diversity_loss: Encourage uniform slot usage [Section 9.3]
-    - use_balance_loss: Penalize uneven slot distribution [Section 8.5]
-    - use_sparsity_loss: Encourage decisive routing [Section 9.4]
-    - use_consistency_loss: Cross-layer cache decodability [Section 9.2]
-    - use_ponder_loss: Penalize excessive computation [Section 10.1]
+    - use_ponder_cost: Penalize excessive computation
+
+    TRM INSIGHTS (from TinyRecursiveModels paper):
+    - use_deep_supervision: Train on every pass with weighted loss
+    - use_answer_feedback: Feed previous pass's answer back
     """
 
-    # === CORE FEATURES (disable to break DLSMN) ===
+    # === CORE FEATURES (disable to break architecture) ===
     use_cache: bool = True              # Without this, it's just a transformer
     use_selection_head: bool = True     # Without this, no selective caching
     use_multi_pass: bool = True         # Without this, single-pass only
 
-    # === IMPROVEMENTS (disable for ablation) ===
-    # Routing improvements
+    # === ARCHITECTURE IMPROVEMENTS ===
     use_gumbel_softmax: bool = True     # False = argmax routing (non-differentiable)
     use_slot_embeddings: bool = True    # False = zero-init cache
-    use_hippo_init: bool = True         # Use HiPPO initialization for slot embeddings (better long-range memory)
-    use_hybrid_routing: bool = False    # False = learned routing only (RECOMMENDED DEFAULT)
-                                        # True = add content-based similarity (only if needed)
     use_layer_id: bool = True           # False = no layer separation in cache
+    use_cache_self_attn: bool = True    # Cache-to-cache attention after writes
+    use_act_halting: bool = True        # Model-level adaptive halting
+    use_layer_act: bool = True          # Per-layer ACT iterations
+    use_gated_fusion: bool = True       # Gated fusion of input and cache context
+    use_linear_attention: bool = True   # O(S) linear attention
 
-    # Architecture improvements
-    use_cache_self_attn: bool = True    # Cache-to-cache attention AFTER each layer's write (pass-aware)
-    use_between_pass_consolidation: bool = False  # Additional "sleep-like" consolidation between passes
-    use_act_halting: bool = True        # False = fixed number of passes (model-level)
-    use_layer_act: bool = True          # False = fixed recurrent steps (layer-level)
-    use_gated_fusion: bool = True       # False = additive fusion
-    use_moe_memory: bool = True         # MoE-style memory routing (should I read? should I write?)
-    use_cache_informed_write: bool = True  # Write decisions informed by cache context (usefulness vs value-add)
-    
-    # Memory optimization (not gradient-related - AdamAtan2 handles gradient magnitude)
-    detach_cache_between_passes: bool = False  # With AdamAtan2, we can backprop through cache
-    use_linear_attention: bool = True   # Use O(S) linear attention instead of O(S²) softmax attention
+    # === AUXILIARY LOSSES ===
+    use_diversity_loss: bool = True     # Prevent slot collapse
+    use_ponder_cost: bool = True        # Penalize excessive passes
+    ponder_cost_weight: float = 0.01    # Weight of ponder cost
 
-    # === AUXILIARY LOSSES (simplified) ===
-    use_diversity_loss: bool = True     # Prevent slot collapse (warmup only)
-    # REMOVED: ponder_loss (redundant with dual Q-head which learns task-aware halting),
-    #          balance (redundant with diversity), sparsity (redundant with Gumbel),
-    #          consistency (over-engineered, no evidence it helps)
+    # === TRM INSIGHTS ===
+    use_deep_supervision: bool = True   # Train on every pass with weighted loss
+    use_answer_feedback: bool = True    # Feed previous pass's answer back
+    deep_supervision_decay: float = 0.8 # Weight decay for earlier passes
 
-    # === REFINEMENTS (from review) ===
-    use_write_count_masking: bool = True # Mask unwritten slots with -inf
-    use_temporal_decay: bool = True      # Store age per slot
-    use_noise_injection: bool = True     # Add noise to router logits early in training
-    use_soft_wta_update: bool = True     # Use exponential weighting for updates
-
-    # === TRM INSIGHTS (ref/2510.04871v1.pdf) ===
-    use_deep_supervision: bool = True    # Train on every pass with weighted loss
-    use_answer_feedback: bool = True     # Feed previous pass's answer back (TRM's key insight)
-    no_act_continue: bool = True         # TRM: Skip Q_continue loss (paper recommends True)
-    # NOTE: use_refinement_read removed - refinement happens through multi-pass mechanism
-    use_gradient_free_passes: bool = False  # With AdamAtan2, train all passes (no gradient explosion)
-    # NOTE: Set to True if you run out of memory on multi-pass training
-    
-    # === HALTING DURING TRAINING ===
-    halt_exploration_prob: float = 0.3   # Prob of continuing despite confidence (ε-greedy exploration)
-    deep_supervision_decay: float = 0.8  # Weight decay for earlier passes (later = more important)
-    use_ponder_cost: bool = True         # Penalize using more passes than needed
-    ponder_cost_weight: float = 0.01     # Weight of ponder cost in total loss
-    use_inner_loop_halting: bool = True  # Allow early exit from inner (L_cycles) loop based on confidence
-                                         # TRM doesn't do this, but it can save compute
-
-    # === POSITION ENCODING (TRM insight: RoPE saves params) ===
-    # Options: "rope" (zero params), "learned" (heavy ~1.6M), "none"
-    pos_encoding: str = "rope"           # Default to RoPE like TRM
+    # === POSITION ENCODING ===
+    pos_encoding: str = "rope"          # "rope" (zero params), "learned", or "none"
 
     def describe(self) -> str:
         """Return a string describing enabled features."""
@@ -99,59 +110,52 @@ class FeatureFlags:
         if self.use_selection_head: core.append("selection")
         if self.use_multi_pass: core.append("multi-pass")
 
-        improvements = []
-        if self.use_gumbel_softmax: improvements.append("gumbel")
-        if self.use_slot_embeddings: improvements.append("slot-emb")
-        if self.use_hippo_init: improvements.append("hippo")
-        if self.use_hybrid_routing: improvements.append("hybrid")
-        if self.use_layer_id: improvements.append("layer-id")
-        if self.use_cache_self_attn: improvements.append("cache-attn")
-        if self.use_act_halting: improvements.append("ACT")
-        if self.use_gated_fusion: improvements.append("gated")
+        arch = []
+        if self.use_gumbel_softmax: arch.append("gumbel")
+        if self.use_slot_embeddings: arch.append("slot-emb")
+        if self.use_layer_id: arch.append("layer-id")
+        if self.use_cache_self_attn: arch.append("cache-attn")
+        if self.use_act_halting: arch.append("model-ACT")
+        if self.use_layer_act: arch.append("layer-ACT")
+        if self.use_gated_fusion: arch.append("gated")
+        if self.use_linear_attention: arch.append("linear-attn")
 
         losses = []
         if self.use_diversity_loss: losses.append("div")
-
-        refinements = []
-        if self.use_write_count_masking: refinements.append("masking")
-        if self.use_temporal_decay: refinements.append("decay")
-        if self.use_noise_injection: refinements.append("noise")
-        if self.use_soft_wta_update: refinements.append("soft-wta")
+        if self.use_ponder_cost: losses.append("ponder")
 
         trm = []
         if self.use_deep_supervision: trm.append("deep-sup")
         if self.use_answer_feedback: trm.append("ans-fb")
-        if self.no_act_continue: trm.append("no-q-cont")  # Paper recommends this
-        # refinement_read removed
-        if self.use_gradient_free_passes: trm.append("no-grad")
-        if self.use_inner_loop_halting: trm.append("inner-halt")
 
         return (f"Core: [{', '.join(core)}] | "
-                f"Improvements: [{', '.join(improvements)}] | "
-                f"Refinements: [{', '.join(refinements)}] | "
-                f"TRM: [{', '.join(trm)}] | "
-                f"Losses: [{', '.join(losses)}]")
+                f"Arch: [{', '.join(arch)}] | "
+                f"Losses: [{', '.join(losses)}] | "
+                f"TRM: [{', '.join(trm)}]")
 
 
-# Preset configurations for common ablation experiments
+# ============================================================================
+# Feature Presets
+# ============================================================================
+
 FEATURE_PRESETS = {
     # Full model with all features
     "full": FeatureFlags(),
 
-    # Fast-full: All features enabled, but model hyperparams adjusted for speed in main()
-    # Use this when you want all features but need faster iteration
+    # Fast-full: All features enabled (model hyperparams adjusted in main())
     "fast_full": FeatureFlags(),
 
     # Core only - minimal DLSMN
     "core_only": FeatureFlags(
         use_gumbel_softmax=False,
         use_slot_embeddings=False,
-        use_hybrid_routing=False,
         use_layer_id=False,
         use_cache_self_attn=False,
         use_act_halting=False,
+        use_layer_act=False,
         use_gated_fusion=False,
         use_diversity_loss=False,
+        use_ponder_cost=False,
     ),
 
     # No multi-pass (single pass baseline)
@@ -161,23 +165,6 @@ FEATURE_PRESETS = {
         use_act_halting=False,
     ),
 
-    # No Gumbel-Softmax (hard routing from start)
-    "no_gumbel": FeatureFlags(use_gumbel_softmax=False),
-
-    # No slot embeddings (zero-init cache)
-    "no_slot_emb": FeatureFlags(use_slot_embeddings=False),
-
-    # With hybrid routing (learned + content-based, only if needed)
-    "with_hybrid": FeatureFlags(use_hybrid_routing=True),
-
-    # No cache-to-cache attention
-    "no_cache_attn": FeatureFlags(use_cache_self_attn=False),
-
-    # No auxiliary losses
-    "no_aux_loss": FeatureFlags(
-        use_diversity_loss=False,
-    ),
-
     # Fast training (minimal overhead)
     "fast": FeatureFlags(
         use_multi_pass=False,
@@ -185,173 +172,106 @@ FEATURE_PRESETS = {
         use_act_halting=False,
     ),
 
-    # Runpod optimized - balanced for ARC evaluation with memory constraints
-    "runpod": FeatureFlags(
-        use_diversity_loss=True,     # Keep diversity to prevent slot collapse
-        use_answer_feedback=True,    # Keep answer feedback mechanism
-    ),
-
     # TRM-style: Model passes + Memory Cache, NO layer iterations
-    # Combines TinyRecursiveModels approach with our global cache
-    # - Multiple model passes (TRM's H_cycles equivalent)
-    # - Memory cache with read/write gates (our contribution)
-    # - NO layer-level ACT iterations (TRM doesn't use this)
-    # - Deep supervision on all passes
-    # - Answer feedback for refinement
     "trm": FeatureFlags(
-        # Core: Keep cache and multi-pass
         use_cache=True,
         use_selection_head=True,
         use_multi_pass=True,
-        
-        # Model-level halting: YES
-        use_act_halting=True,           # Multiple passes with adaptive halting
-        
-        # Layer-level iterations: NO (TRM-style)
-        use_layer_act=False,            # KEY: No pondering inside layers!
-        
-        # Memory improvements: Keep all
+        use_act_halting=True,        # Model-level halting: YES
+        use_layer_act=False,         # Layer iterations: NO (TRM-style)
         use_gumbel_softmax=True,
         use_slot_embeddings=True,
-        use_hippo_init=True,
         use_layer_id=True,
-        use_cache_self_attn=True,       # Cache consolidation between passes
+        use_cache_self_attn=True,
         use_gated_fusion=True,
-        use_moe_memory=True,            # Read/write gates
-        use_cache_informed_write=True,
         use_linear_attention=True,
-        
-        # Refinements: Keep useful ones
-        use_write_count_masking=True,
-        use_temporal_decay=True,
-        use_noise_injection=True,
-        use_soft_wta_update=True,
-        
-        # TRM insights: All enabled
-        use_deep_supervision=True,      # Loss at every pass
-        use_answer_feedback=True,       # Key TRM insight
-        no_act_continue=True,           # Paper recommends
-        
-        # Losses
+        use_deep_supervision=True,
+        use_answer_feedback=True,
         use_diversity_loss=True,
-        use_ponder_cost=True,           # Penalize unnecessary passes
-        
-        # Position encoding
+        use_ponder_cost=True,
         pos_encoding="rope",
     ),
 
-    # TRM-minimal: Same as TRM but with minimal features for comparison
+    # TRM-minimal: Minimal features for comparison
     "trm_minimal": FeatureFlags(
-        # Core only
         use_cache=True,
         use_selection_head=True,
         use_multi_pass=True,
-        
-        # Model-level halting: YES
         use_act_halting=True,
-        
-        # Layer-level iterations: NO
         use_layer_act=False,
-        
-        # Minimal memory features
         use_gumbel_softmax=True,
         use_slot_embeddings=True,
-        use_hippo_init=True,
         use_layer_id=False,
-        use_cache_self_attn=False,      # No cache attention
+        use_cache_self_attn=False,
         use_gated_fusion=False,
-        use_moe_memory=True,            # Keep read/write gates
-        use_cache_informed_write=False,
         use_linear_attention=True,
-        
-        # Minimal refinements
-        use_write_count_masking=True,
-        use_temporal_decay=False,
-        use_noise_injection=False,
-        use_soft_wta_update=False,
-        
-        # TRM insights
         use_deep_supervision=True,
         use_answer_feedback=True,
-        no_act_continue=True,
-        
-        # Losses
         use_diversity_loss=False,
         use_ponder_cost=True,
-        
         pos_encoding="rope",
     ),
 }
 
 
 # ============================================================================
-# Training Configuration (Section 8.4, 9.5)
+# Training Configuration
 # ============================================================================
 
 @dataclass
 class TrainingConfig:
     """
-    Training configuration - simplified direct training.
+    Training configuration.
 
     Philosophy:
     - Start at max capacity (full passes, full recurrent steps)
     - Efficiency losses push model to use fewer when it can
-    - No warmup/transition phases - train directly
-    
-    Curriculum Learning (optional):
-    - Start with 1 pass, 1 recurrence for stable gradient flow
-    - Gradually increase to max as training progresses
-    - Helps prevent gradient collapse in deep computation chains
     """
-    # Temperature for Gumbel-Softmax routing
+    # === TEMPERATURE ANNEALING (Gumbel-Softmax) ===
     tau_start: float = 1.0       # Initial temperature (soft routing)
-    tau_min: float = 0.5         # Final temperature (keep softer to prevent NaN)
-    anneal_rate: float = 0.0003  # Slower annealing for stability
+    tau_min: float = 0.5         # Final temperature
+    anneal_rate: float = 0.0003  # Annealing rate
 
-    # Loss weights - Task
-    lambda_diversity: float = 0.01   # Prevents slot collapse
-    lambda_q_head: float = 0.1       # Q-head correctness predictor (pass-level halting)
+    # === LOSS WEIGHTS ===
+    # Task losses
+    lambda_diversity: float = 0.01       # Slot diversity
+    lambda_q_head: float = 0.1           # Q-head correctness predictor
     lambda_step_efficiency: float = 0.5  # Layer-level step efficiency
     
-    # Loss weights - Confidence-based
-    lambda_confidence_calibration: float = 1.0   # Align confidence with actual correctness (was 0.5)
-    lambda_halt_prediction: float = 0.3          # Train halt to predict sequence correctness
-    lambda_confidence_monotonicity: float = 0.1  # Later passes should have higher confidence
+    # Confidence losses
+    lambda_confidence_calibration: float = 1.0   # Confidence vs correctness alignment
+    lambda_halt_prediction: float = 0.3          # Halt predicts sequence correctness
+    lambda_confidence_monotonicity: float = 0.1  # Later passes = higher confidence
     
-    # Loss weights - Gate Regularization
-    lambda_gate_polar: float = 0.1               # Gate polarization (push away from 0.5)
-    lambda_gate_sparsity: float = 0.1            # Gate sparsity (target activation ratios)
-    lambda_feedback_polar: float = 0.1           # Feedback gate polarization (answer/iteration gates)
+    # Gate regularization
+    lambda_gate_polar: float = 0.1       # Push gates away from 0.5
+    lambda_gate_sparsity: float = 0.1    # Target gate activation ratios
+    lambda_feedback_polar: float = 0.1   # Feedback gate polarization
 
-    # Gate thresholds - Fixed vs Learned
-    # Fixed thresholds are simpler and force gates to be decisive (polarize to 0 or 1)
-    # The gate VALUE becomes the decision, threshold is just the cutoff
-    use_fixed_gate_threshold: bool = True        # True = fixed 0.5, False = learned per-token
-    gate_threshold: float = 0.5                  # Fixed threshold for read/write gates
-    
-    # Halt thresholds - for confidence-based early stopping
-    # These are different from gate thresholds - they involve compute budget
-    use_fixed_halt_threshold: bool = True        # True = fixed confidence threshold
-    halt_confidence_threshold: float = 0.8       # Stop iterating when confidence > this
+    # === GATE THRESHOLDS ===
+    use_fixed_gate_threshold: bool = True   # True = fixed 0.5, False = learned
+    gate_threshold: float = 0.5             # Fixed threshold value
 
-    # Hybrid routing
-    alpha_learned: float = 1.0  # 1.0 = pure learned routing
+    # === HALT THRESHOLDS ===
+    confidence_threshold: float = 0.8       # Stop when confidence > this
 
-    # Compute budget (model starts at max, learns to reduce)
-    max_passes: int = 10           # Maximum thinking passes
-    max_recurrent_steps: int = 10  # Maximum refinement steps per layer
+    # === COMPUTE BUDGET ===
+    max_passes: int = 6                     # Maximum model-level passes
+    max_recurrent_steps: int = 4            # Maximum per-layer iterations
 
     # === CURRICULUM LEARNING ===
-    # Start simple (1 pass, 1 recurrence), gradually increase
-    use_curriculum: bool = False           # Enable curriculum learning
-    curriculum_warmup_steps: int = 135    # Steps before increasing complexity
-    curriculum_increase_every: int = 135  # Steps between each increase
+    use_curriculum: bool = False
+    curriculum_warmup_steps: int = 135
+    curriculum_increase_every: int = 135
     
-    # EMA for training stability
+    # === WARMUP (force max passes to stabilize Q-halt) ===
+    warmup_epochs: int = 1  # Epochs to force max passes (no early halt)
+
+    # === EMA ===
     use_ema: bool = True
     ema_decay: float = 0.999
 
-    # Feature flags for ablation
+    # === FEATURE FLAGS ===
     features: FeatureFlags = field(default_factory=FeatureFlags)
 
     def get_temperature(self, step: int) -> float:
@@ -359,49 +279,21 @@ class TrainingConfig:
         return max(self.tau_min, self.tau_start * math.exp(-self.anneal_rate * step))
     
     def get_curriculum_passes(self, step: int) -> int:
-        """
-        Get effective number of passes based on curriculum schedule.
-        
-        Starts at 1, increases by 1 every `curriculum_increase_every` steps
-        after `curriculum_warmup_steps`, up to `max_passes`.
-        """
+        """Get effective passes based on curriculum (1 → max_passes)."""
         if not self.use_curriculum:
             return self.max_passes
-        
         if step < self.curriculum_warmup_steps:
             return 1
-        
-        # How many increases after warmup?
-        steps_after_warmup = step - self.curriculum_warmup_steps
-        num_increases = steps_after_warmup // self.curriculum_increase_every
-        
-        # Start at 1, increase up to max_passes
-        return min(1 + num_increases, self.max_passes)
+        steps_after = step - self.curriculum_warmup_steps
+        increases = steps_after // self.curriculum_increase_every
+        return min(1 + increases, self.max_passes)
     
     def get_curriculum_recurrence(self, step: int) -> int:
-        """
-        Get effective number of recurrent steps based on curriculum schedule.
-        
-        Same schedule as passes - starts at 1, increases gradually.
-        """
+        """Get effective recurrence based on curriculum (1 → max_recurrent_steps)."""
         if not self.use_curriculum:
             return self.max_recurrent_steps
-        
         if step < self.curriculum_warmup_steps:
             return 1
-        
-        steps_after_warmup = step - self.curriculum_warmup_steps
-        num_increases = steps_after_warmup // self.curriculum_increase_every
-        
-        return min(1 + num_increases, self.max_recurrent_steps)
-    
-    def get_pass_mode(self, step: int, training: bool = True) -> str:
-        """
-        Pass mode for adaptive computation.
-
-        Simplified: Always adaptive - let efficiency losses drive reduction.
-        Model starts at max capacity and learns to reduce.
-        """
-        # Always use adaptive with ponder penalty
-        # The ponder loss will push model to use fewer passes when it can
-        return 'adaptive'
+        steps_after = step - self.curriculum_warmup_steps
+        increases = steps_after // self.curriculum_increase_every
+        return min(1 + increases, self.max_recurrent_steps)

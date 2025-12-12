@@ -72,6 +72,7 @@ import math
 from typing import Optional, Dict, Tuple
 
 from .utils import gumbel_softmax
+from .config import SLOT_DIMS
 
 
 class MemoryController(nn.Module):
@@ -108,8 +109,8 @@ class MemoryController(nn.Module):
         dropout: float = 0.1,
         max_iterations: int = 4,  # For temporal embeddings
         max_passes: int = 6,      # For temporal embeddings
-        use_fixed_threshold: bool = True,  # NEW: Use fixed 0.5 instead of learned
-        fixed_threshold: float = 0.5,      # NEW: Fixed threshold value
+        use_fixed_threshold: bool = True,
+        fixed_threshold: float = 0.5,
     ):
         super().__init__()
         self.d_model = d_model
@@ -121,14 +122,12 @@ class MemoryController(nn.Module):
         self.use_fixed_threshold = use_fixed_threshold
         self.fixed_threshold = fixed_threshold
         
-        # === Slot Metadata Dimensions ===
-        # Metadata stored alongside content: [content (d_cache) | metadata (d_meta)]
-        # Metadata: confidence (1) + layer_embed (8) + iter_embed (4) + pass_embed (4) = 17 → 16
-        self.d_layer_embed = 8
-        self.d_iter_embed = 4
-        self.d_pass_embed = 4
-        self.d_meta = 1 + self.d_layer_embed + self.d_iter_embed + self.d_pass_embed  # 17
-        self.d_slot = d_cache + self.d_meta  # Total slot dimension
+        # === Slot Metadata Dimensions (from centralized config) ===
+        self.d_layer_embed = SLOT_DIMS.d_layer_embed
+        self.d_iter_embed = SLOT_DIMS.d_iter_embed
+        self.d_pass_embed = SLOT_DIMS.d_pass_embed
+        self.d_meta = SLOT_DIMS.d_meta
+        self.d_slot = SLOT_DIMS.d_slot(d_cache)
         
         # === Temporal Embedding Tables ===
         self.layer_embed = nn.Embedding(num_layers, self.d_layer_embed)
@@ -430,9 +429,13 @@ class MemoryController(nn.Module):
         cache: torch.Tensor,                   # [B, L*K, D_slot]
         temperature: float = 1.0,
         hard: bool = False,
-        max_write_tokens: Optional[int] = None,
+
         iteration_idx: int = 0,                # Current layer iteration
         pass_idx: int = 0,                     # Current model pass
+        # Centralized temporal embeddings (from model) - use these if provided
+        cache_layer_embed: Optional[nn.Embedding] = None,
+        cache_iter_embed: Optional[nn.Embedding] = None,
+        cache_pass_embed: Optional[nn.Embedding] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         WRITE Phase: Selectively update cache with output content.
@@ -448,7 +451,7 @@ class MemoryController(nn.Module):
             cache: Global cache [B, L*K, D_slot] (content + metadata)
             temperature: Gumbel-softmax temperature
             hard: Use hard slot selection
-            max_write_tokens: Limit tokens considered for writing
+
             iteration_idx: Current iteration within layer (for temporal embedding)
             pass_idx: Current model-level pass (for temporal embedding)
 
@@ -463,9 +466,7 @@ class MemoryController(nn.Module):
         K = self.num_slots
         device = output.device
 
-        # Limit tokens for efficiency
-        T = min(S, max_write_tokens) if max_write_tokens else S
-        tokens = output[:, :T, :]  # [B, T, D_model]
+        tokens = output  # [B, S, D_model] - all tokens are candidates
 
         # Get local cache and split into content/metadata
         local_cache = self._get_local_cache(cache)  # [B, K, D_slot]
@@ -547,9 +548,14 @@ class MemoryController(nn.Module):
         has_writes = (slot_weights.squeeze(-1) > 0.1).unsqueeze(-1).float()  # [B, K, 1]
         
         # Build temporal embedding for newly written content
-        layer_emb = self.layer_embed(torch.tensor([self.layer_idx], device=device))  # [1, D_layer]
-        iter_emb = self.iter_embed(torch.tensor([iteration_idx], device=device))    # [1, D_iter]
-        pass_emb = self.pass_embed(torch.tensor([pass_idx], device=device))         # [1, D_pass]
+        # Use centralized embeddings if provided, otherwise fall back to local
+        layer_embed_table = cache_layer_embed if cache_layer_embed is not None else self.layer_embed
+        iter_embed_table = cache_iter_embed if cache_iter_embed is not None else self.iter_embed
+        pass_embed_table = cache_pass_embed if cache_pass_embed is not None else self.pass_embed
+        
+        layer_emb = layer_embed_table(torch.tensor([self.layer_idx], device=device))  # [1, D_layer]
+        iter_emb = iter_embed_table(torch.tensor([iteration_idx], device=device))    # [1, D_iter]
+        pass_emb = pass_embed_table(torch.tensor([pass_idx], device=device))         # [1, D_pass]
         new_temporal = torch.cat([layer_emb, iter_emb, pass_emb], dim=-1)  # [1, D_temporal]
         new_temporal = new_temporal.unsqueeze(0).expand(B, K, -1)  # [B, K, D_temporal]
         
@@ -616,76 +622,48 @@ class MemoryController(nn.Module):
         return result
 
 
-class ConfidenceEstimator(nn.Module):
+class LayerHaltEstimator(nn.Module):
     """
-    Estimates confidence/quality of model output for halting decisions.
-
-    This complements the Q-halt mechanism by providing a direct
-    assessment of output quality, not just hidden state pooling.
-
-    Signals considered:
-    1. Output entropy (low = confident)
-    2. Hidden state coherence (how "settled" is the representation)
-    3. Pass-to-pass agreement (optional, if prev_output provided)
+    Per-layer halting estimator based on info gain and budget.
     
-    Learned halt thresholds (context + budget-aware):
-    - Layer-level: Should this layer stop iterating?
-    - Model-level: Should the model stop passes?
+    Each layer gets its own estimator because:
+    1. Different layers have different roles (feature extraction vs reasoning)
+    2. Layers may need different amounts of refinement
+    3. Layer-specific patterns in when to halt
     
-    Both thresholds take into account:
-    - Current hidden state quality (h_pooled)
-    - Current position in compute budget (iter/pass ratio)
-    - Remaining budget ratio (how much compute is left)
+    Halt criterion: Combines info gain with remaining budget
+    - High info gain = making progress → continue
+    - Low info gain = diminishing returns → halt
+    - Low budget = save compute → halt even if making some progress
+    
+    The threshold network learns to balance these factors.
     """
-
-    def __init__(self, d_model: int, vocab_size: int, max_iterations: int = 8, max_passes: int = 8):
+    
+    def __init__(self, d_model: int, layer_idx: int, max_iterations: int = 8):
         super().__init__()
         self.d_model = d_model
-        self.vocab_size = vocab_size
+        self.layer_idx = layer_idx
         self.max_iterations = max_iterations
-        self.max_passes = max_passes
-
-        # Hidden state analyzer
+        
+        # Lightweight analyzer (per-layer, so keep small)
         self.h_analyzer = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
+            nn.Linear(d_model, d_model // 4),
             nn.SiLU(),
-            nn.Linear(d_model // 2, 1),
+            nn.Linear(d_model // 4, d_model // 8),
         )
-
-        # Combine signals
-        self.confidence_combiner = nn.Sequential(
-            nn.Linear(3, 16),  # 3 signals: h_score, entropy, agreement
+        
+        # Halt threshold: decides when THIS layer should stop iterating
+        # Input: h_features + info_gain + budget
+        # Now uses info_gain instead of stability
+        self.halt_threshold = nn.Sequential(
+            nn.Linear(d_model // 8 + 2, d_model // 16),  # +2 for info_gain, budget
             nn.SiLU(),
-            nn.Linear(16, 1),
+            nn.Linear(d_model // 16, 1),
             nn.Sigmoid(),
         )
         
-        # === LEARNED HALT THRESHOLDS ===
-        # Input: [h_pooled (d_model), confidence (1), current_ratio (1), budget_remaining_ratio (1)]
-        # Output: threshold in [0, 1] - halt if confidence > threshold
-        
-        # Layer-level halt threshold: decides when a layer should stop iterating
-        # Lower threshold = easier to halt (needs less confidence)
-        # Inputs: h_pooled + confidence + iter_ratio + budget_ratio
-        # - If confidence is LOW and budget is HIGH → raise threshold (continue)
-        # - If confidence is HIGH or budget is LOW → lower threshold (halt)
-        self.layer_halt_threshold = nn.Sequential(
-            nn.Linear(d_model + 3, d_model // 4),  # +3 for confidence, iter_ratio, budget_ratio
-            nn.SiLU(),
-            nn.Linear(d_model // 4, 1),
-            nn.Sigmoid(),
-        )
-        
-        # Model-level halt threshold: decides when to stop model passes
-        self.model_halt_threshold = nn.Sequential(
-            nn.Linear(d_model + 3, d_model // 4),  # +3 for confidence, pass_ratio, budget_ratio
-            nn.SiLU(),
-            nn.Linear(d_model // 4, 1),
-            nn.Sigmoid(),
-        )
-
         self._init_weights()
-
+    
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
@@ -693,163 +671,289 @@ class ConfidenceEstimator(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
         
-        # CRITICAL: Initialize halt thresholds to output HIGH values (0.8-0.9)
-        # This encourages exploration (more iterations/passes) early in training.
-        # The sigmoid output layer needs positive bias to start high.
-        # sigmoid(2.0) ≈ 0.88, so bias=2.0 gives ~88% initial threshold
+        # Initialize threshold to encourage more iterations initially
+        # Low threshold = need low info_gain to halt = iterate more
         with torch.no_grad():
-            # Layer halt threshold - last layer is the sigmoid input
-            for layer in self.layer_halt_threshold:
+            for layer in self.halt_threshold:
                 if isinstance(layer, nn.Linear) and layer.out_features == 1:
-                    layer.bias.fill_(2.0)  # sigmoid(2.0) ≈ 0.88
-            # Model halt threshold - same treatment
-            for layer in self.model_halt_threshold:
-                if isinstance(layer, nn.Linear) and layer.out_features == 1:
-                    layer.bias.fill_(2.0)  # sigmoid(2.0) ≈ 0.88
-
+                    layer.bias.fill_(-1.0)  # sigmoid(-1) ≈ 0.27 (low threshold)
+    
+    def compute_info_gain(
+        self, 
+        h: torch.Tensor,                 # [B, S, D]
+        h_prev: Optional[torch.Tensor],  # [B, S, D]
+    ) -> torch.Tensor:
+        """
+        Compute information gain via entropy change of hidden state.
+        
+        Info gain = |H(h_prev) - H(h)| (absolute entropy change)
+        High info gain = iteration made meaningful change
+        Low info gain = representation settled, can halt
+        """
+        if h_prev is None:
+            # First iteration - return high info gain to encourage continuation
+            return torch.ones(h.shape[0], device=h.device) * 0.5
+        
+        B = h.shape[0]
+        
+        # Compute entropy of hidden state distributions
+        # Treat hidden dim as distribution via softmax
+        p_curr = F.softmax(h, dim=-1)  # [B, S, D]
+        p_prev = F.softmax(h_prev, dim=-1)  # [B, S, D]
+        
+        # Entropy: -sum(p * log(p))
+        entropy_curr = -(p_curr * torch.log(p_curr + 1e-8)).sum(dim=-1).mean(dim=-1)  # [B]
+        entropy_prev = -(p_prev * torch.log(p_prev + 1e-8)).sum(dim=-1).mean(dim=-1)  # [B]
+        
+        # Info gain = absolute entropy change (direction doesn't matter)
+        info_gain = (entropy_prev - entropy_curr).abs()  # [B]
+        
+        # Normalize to roughly [0, 1] range (entropy is in [0, log(D)])
+        max_entropy = math.log(self.d_model)
+        info_gain = (info_gain / max_entropy).clamp(0, 1)
+        
+        return info_gain
+    
+    # def compute_stability(
+    #     self, 
+    #     h: torch.Tensor,           # [B, S, D]
+    #     h_prev: Optional[torch.Tensor],  # [B, S, D]
+    # ) -> torch.Tensor:
+    #     """
+    #     Compute hidden state stability via cosine similarity.
+    #     DEPRECATED: Kept for backward compatibility, but info_gain is preferred.
+    #     """
+    #     if h_prev is None:
+    #         return torch.zeros(h.shape[0], device=h.device)
+        
+    #     B = h.shape[0]
+    #     h_flat = h.view(B, -1)
+    #     h_prev_flat = h_prev.view(B, -1)
+    #     stability = F.cosine_similarity(h_flat, h_prev_flat, dim=-1)
+    #     return stability.clamp(0, 1)
+    
     def forward(
         self,
-        h: torch.Tensor,                        # [B, S, D_model]
-        logits: Optional[torch.Tensor] = None,  # [B, S, V]
-        prev_logits: Optional[torch.Tensor] = None,  # [B, S, V] from previous pass
-    ) -> torch.Tensor:
+        h: torch.Tensor,                      # [B, S, D]
+        h_prev: Optional[torch.Tensor] = None,  # [B, S, D]
+        current_iter: int = 0,
+        max_iter: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute confidence score in [0, 1].
-
+        Compute info gain and halt threshold.
+        
+        Halt decision: halt if info_gain < threshold
+        - Low info_gain = not making progress → halt
+        - Threshold adapts based on budget and hidden state
+        
         Returns:
-            confidence: [B] confidence score per batch item
+            info_gain: [B] information gain (replaces stability)
+            threshold: [B] learned halt threshold
         """
+        max_iter = max_iter or self.max_iterations
         B = h.shape[0]
         device = h.device
-
-        # Signal 1: Hidden state quality
-        h_pooled = h.mean(dim=1)  # [B, D_model]
-        h_score = torch.sigmoid(self.h_analyzer(h_pooled))  # [B, 1]
-
-        # Signal 2: Output entropy (if logits provided)
-        if logits is not None:
-            probs = F.softmax(logits, dim=-1)
-            entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)  # [B, S]
-            # Normalize: max entropy = log(vocab_size)
-            max_entropy = math.log(self.vocab_size)
-            normalized_entropy = entropy.mean(dim=1, keepdim=True) / max_entropy  # [B, 1]
-            # Low entropy = high confidence
-            entropy_confidence = 1 - normalized_entropy
-        else:
-            entropy_confidence = torch.ones(B, 1, device=device) * 0.5
-
-        # Signal 3: Agreement with previous pass (if provided)
-        if prev_logits is not None and logits is not None:
-            # KL divergence between current and previous
-            curr_probs = F.softmax(logits, dim=-1)
-            prev_probs = F.softmax(prev_logits, dim=-1)
-            kl = (curr_probs * (torch.log(curr_probs + 1e-8) - torch.log(prev_probs + 1e-8))).sum(dim=-1)
-            agreement = torch.exp(-kl.mean(dim=1, keepdim=True))  # [B, 1] - high when similar
-        else:
-            agreement = torch.ones(B, 1, device=device) * 0.5
-
-        # Combine signals
-        signals = torch.cat([h_score, entropy_confidence, agreement], dim=-1)  # [B, 3]
-        confidence = self.confidence_combiner(signals).squeeze(-1)  # [B]
-
-        return confidence
-
-    def get_layer_halt_threshold(
-        self,
-        h: torch.Tensor,                      # [B, S, D_model]
-        confidence: torch.Tensor,             # [B] confidence scores
-        current_iter: int,                    # Current iteration (0-indexed)
-        max_iter: Optional[int] = None,       # Max iterations for this layer
-    ) -> torch.Tensor:
-        """
-        Compute learned halt threshold for layer-level iterations.
         
-        Args:
-            h: Hidden states [B, S, D_model]
-            confidence: Current confidence scores [B]
-            current_iter: Current iteration index (0-indexed)
-            max_iter: Maximum iterations (uses self.max_iterations if None)
-            
-        Returns:
-            threshold: [B] threshold values in [0, 1]
-            
-        The model learns when to halt based on:
-        - h: Current representation quality (implicit)
-        - confidence: Explicit quality signal
-        - iter_ratio: How far through iterations (0→1)
-        - budget_ratio: How much budget remains (1→0)
+        # Compute info gain (replaces stability)
+        info_gain = self.compute_info_gain(h, h_prev)  # [B]
         
-        Intuition:
-        - Low confidence + high budget → raise threshold (push for more compute)
-        - High confidence OR low budget → lower threshold (halt)
-        """
-        max_iter = max_iter if max_iter is not None else self.max_iterations
-        device = h.device
-        B = h.shape[0]
+        # Hidden state features
+        h_pooled = h.mean(dim=1)  # [B, D]
+        h_features = self.h_analyzer(h_pooled)  # [B, D//8]
         
-        # Pool hidden states
-        h_pooled = h.mean(dim=1)  # [B, D_model]
-        
-        # Compute budget-aware features
-        iter_ratio = current_iter / max(max_iter - 1, 1)  # 0 → 1 as iterations progress
-        budget_remaining = (max_iter - 1 - current_iter) / max(max_iter - 1, 1)  # 1 → 0 as budget depletes
-        
-        # Create feature tensors
-        confidence_tensor = confidence.unsqueeze(-1) if confidence.dim() == 1 else confidence  # [B, 1]
-        iter_ratio_tensor = torch.full((B, 1), iter_ratio, device=device, dtype=h.dtype)
+        # Budget feature: how much compute budget remains
+        # Low budget → lower threshold (more willing to halt)
+        budget_remaining = (max_iter - 1 - current_iter) / max(max_iter - 1, 1)
         budget_tensor = torch.full((B, 1), budget_remaining, device=device, dtype=h.dtype)
         
-        # Combine features: h_pooled + confidence + iter_ratio + budget_remaining
-        features = torch.cat([h_pooled, confidence_tensor, iter_ratio_tensor, budget_tensor], dim=-1)  # [B, D+3]
+        # Combine features: h_features + info_gain + budget
+        info_gain_tensor = info_gain.unsqueeze(-1)  # [B, 1]
+        features = torch.cat([h_features, info_gain_tensor, budget_tensor], dim=-1)
         
-        # Compute learned threshold
-        threshold = self.layer_halt_threshold(features).squeeze(-1)  # [B]
+        # Compute threshold
+        # Threshold adjusts based on budget:
+        # - High budget: higher threshold (require more info_gain to continue)
+        # - Low budget: lower threshold (halt even with some info_gain)
+        threshold = self.halt_threshold(features).squeeze(-1)  # [B]
         
-        return threshold
+        return info_gain, threshold
+        threshold = self.halt_threshold(features).squeeze(-1)  # [B]
+        
+        return stability, threshold
 
-    def get_model_halt_threshold(
+
+class ModelHaltEstimator(nn.Module):
+    """
+    Model-level halting estimator using entropy AND correctness prediction.
+    
+    Key insight from TRM: Use Q-learning for halting!
+    - q_halt: "Is the current answer correct?" (trained with BCE against actual correctness)
+    - Halt when: q_halt > 0 (model believes answer is correct)
+    
+    This is smarter than entropy alone because:
+    1. High confidence ≠ correct answer (entropy can be misleading)
+    2. Direct supervision: we know if answer is right during training
+    3. Learns to recognize what "wrong answers look like"
+    
+    Also uses entropy as auxiliary signal:
+    - Low entropy = confident prediction (peaked distribution)
+    - Information gain = entropy reduction between passes
+    """
+    
+    def __init__(self, d_model: int, vocab_size: int, max_passes: int = 8):
+        super().__init__()
+        self.d_model = d_model
+        self.vocab_size = vocab_size
+        self.max_passes = max_passes
+        self.max_entropy = math.log(vocab_size)
+        
+        # Hidden state analyzer
+        self.h_analyzer = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.SiLU(),
+            nn.Linear(d_model // 2, d_model // 4),
+        )
+        
+        # === Q-HALT HEAD (TRM-inspired) ===
+        # Predicts: "Is the current answer correct?"
+        # Output: logit (>0 means "yes, halt", <0 means "no, continue")
+        # Trained with: BCE against actual correctness
+        # 
+        # Now also takes info_gain as input so it can learn:
+        # - High info_gain + low confidence → keep going (making progress)
+        # - Low info_gain + high confidence → halt (converged)
+        # - Low info_gain + low confidence → halt (stuck, save compute)
+        self.q_halt_head = nn.Sequential(
+            nn.Linear(d_model // 4 + 3, d_model // 8),  # +3 for entropy, info_gain, budget
+            nn.SiLU(),
+            nn.Linear(d_model // 8, 1),
+        )
+        
+        # Legacy: Learned threshold (for backward compatibility / ablation)
+        # Can be used instead of q_halt if use_q_halt=False
+        self.halt_threshold = nn.Sequential(
+            nn.Linear(d_model // 4 + 3, d_model // 8),
+            nn.SiLU(),
+            nn.Linear(d_model // 8, 1),
+            nn.Sigmoid(),
+        )
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        # Initialize q_halt to output ~0 (uncertain) initially
+        # This encourages exploration early in training
+        with torch.no_grad():
+            for layer in self.q_halt_head:
+                if isinstance(layer, nn.Linear) and layer.out_features == 1:
+                    layer.bias.fill_(-5.0)  # sigmoid(-5) ≈ 0.007, very unlikely to halt early
+        
+        # Initialize threshold HIGH to encourage exploration
+        with torch.no_grad():
+            for layer in self.halt_threshold:
+                if isinstance(layer, nn.Linear) and layer.out_features == 1:
+                    layer.bias.fill_(1.7)  # sigmoid(1.7) ≈ 0.85
+    
+    @staticmethod
+    def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
+        """Compute entropy: H(p) = -Σ p_i log(p_i)"""
+        probs = F.softmax(logits, dim=-1)
+        log_probs = torch.log(probs + 1e-8)
+        entropy = -(probs * log_probs).sum(dim=-1)  # [B, S]
+        return entropy
+    
+    def compute_confidence(self, logits: torch.Tensor) -> torch.Tensor:
+        """Compute entropy-based confidence: 1 - normalized_entropy"""
+        entropy = self.compute_entropy(logits).mean(dim=1)  # [B]
+        normalized_entropy = entropy / self.max_entropy
+        confidence = 1.0 - normalized_entropy.clamp(0, 1)
+        return confidence  # [B]
+    
+    def compute_information_gain(
         self,
-        h: torch.Tensor,                      # [B, S, D_model]
-        confidence: torch.Tensor,             # [B] confidence scores
-        current_pass: int,                    # Current pass (0-indexed)
-        max_pass: Optional[int] = None,       # Max passes
+        logits: torch.Tensor,                 # [B, S, V] current
+        prev_logits: Optional[torch.Tensor],  # [B, S, V] previous
     ) -> torch.Tensor:
         """
-        Compute learned halt threshold for model-level passes.
+        Compute information gain (entropy reduction).
         
-        Args:
-            h: Hidden states [B, S, D_model]
-            confidence: Current confidence scores [B]
-            current_pass: Current pass index (0-indexed)
-            max_pass: Maximum passes (uses self.max_passes if None)
-            
-        Returns:
-            threshold: [B] threshold values in [0, 1]
-            
-        Intuition:
-        - Low confidence + high budget → raise threshold (push for more compute)
-        - High confidence OR low budget → lower threshold (halt)
+        IG = H(prev) - H(curr)
+        Positive = model became more confident
         """
-        max_pass = max_pass if max_pass is not None else self.max_passes
-        device = h.device
+        if prev_logits is None:
+            return torch.zeros(logits.shape[0], device=logits.device)
+        
+        curr_entropy = self.compute_entropy(logits).mean(dim=1)
+        prev_entropy = self.compute_entropy(prev_logits).mean(dim=1)
+        return prev_entropy - curr_entropy  # [B]
+    
+    def forward(
+        self,
+        h: torch.Tensor,                        # [B, S, D]
+        logits: torch.Tensor,                   # [B, S, V]
+        prev_logits: Optional[torch.Tensor] = None,
+        current_pass: int = 0,
+        max_pass: Optional[int] = None,
+        use_q_halt: bool = True,               # Use Q-halt (TRM) vs entropy threshold
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute confidence, halt decision, and auxiliary info.
+        
+        Returns:
+            confidence: [B] entropy-based confidence (for logging/legacy)
+            q_halt_logits: [B] halt logits (>0 = halt, <0 = continue)
+            aux: dict with entropy, info_gain, threshold for logging
+        """
+        max_pass = max_pass or self.max_passes
         B = h.shape[0]
+        device = h.device
         
-        # Pool hidden states
-        h_pooled = h.mean(dim=1)  # [B, D_model]
+        # Entropy-based confidence
+        confidence = self.compute_confidence(logits)  # [B]
         
-        # Compute budget-aware features
-        pass_ratio = current_pass / max(max_pass - 1, 1)  # 0 → 1 as passes progress
-        budget_remaining = (max_pass - 1 - current_pass) / max(max_pass - 1, 1)  # 1 → 0 as budget depletes
+        # Information gain
+        info_gain = self.compute_information_gain(logits, prev_logits)  # [B]
         
-        # Create feature tensors
-        confidence_tensor = confidence.unsqueeze(-1) if confidence.dim() == 1 else confidence  # [B, 1]
-        pass_ratio_tensor = torch.full((B, 1), pass_ratio, device=device, dtype=h.dtype)
+        # Hidden state features
+        h_pooled = h.mean(dim=1)  # [B, D]
+        h_features = self.h_analyzer(h_pooled)  # [B, D//4]
+        
+        # Budget feature
+        budget_remaining = (max_pass - 1 - current_pass) / max(max_pass - 1, 1)
         budget_tensor = torch.full((B, 1), budget_remaining, device=device, dtype=h.dtype)
         
-        # Combine features: h_pooled + confidence + pass_ratio + budget_remaining
-        features = torch.cat([h_pooled, confidence_tensor, pass_ratio_tensor, budget_tensor], dim=-1)  # [B, D+3]
+        # Entropy feature (normalized)
+        entropy = self.compute_entropy(logits).mean(dim=1)  # [B]
+        entropy_normalized = (entropy / self.max_entropy).unsqueeze(-1)  # [B, 1]
         
-        # Compute learned threshold
-        threshold = self.model_halt_threshold(features).squeeze(-1)  # [B]
+        # Info gain feature (normalized) - helps Q-halt decide if we're making progress
+        info_gain_normalized = (info_gain / self.max_entropy).unsqueeze(-1).clamp(-1, 1)  # [B, 1]
         
-        return threshold
+        # Q-halt: "Is the answer correct?" 
+        # Now includes info_gain so it can learn to consider progress
+        q_features = torch.cat([h_features, entropy_normalized, info_gain_normalized, budget_tensor], dim=-1)
+        q_halt_logits = self.q_halt_head(q_features).squeeze(-1)  # [B]
+        
+        # Legacy threshold (for ablation / backward compat)
+        confidence_tensor = confidence.unsqueeze(-1)
+        info_gain_tensor = info_gain.unsqueeze(-1)
+        threshold_features = torch.cat([h_features, confidence_tensor, info_gain_tensor, budget_tensor], dim=-1)
+        threshold = self.halt_threshold(threshold_features).squeeze(-1)  # [B]
+        
+        # Auxiliary info for logging and loss computation
+        # Keep info_gain with gradients for maximization loss!
+        aux = {
+            'entropy': entropy.detach(),        # [B] for logging
+            'info_gain': info_gain,             # [B] WITH gradients for loss!
+            'threshold': threshold.detach(),    # [B] legacy threshold
+            'q_halt_logits': q_halt_logits.detach(),  # [B] for logging
+        }
+        
+        return confidence, q_halt_logits, aux
+

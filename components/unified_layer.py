@@ -39,7 +39,8 @@ from typing import Optional, Dict, Tuple
 from contextlib import nullcontext
 from torch.utils.checkpoint import checkpoint
 
-from .memory_controller import MemoryController, ConfidenceEstimator
+from .config import SLOT_DIMS
+from .memory_controller import MemoryController, LayerHaltEstimator
 from .modules import LinearAttention, CosSin, CacheSelfAttention
 
 
@@ -151,7 +152,6 @@ class UnifiedMemoryLayer(nn.Module):
         layer_idx: int,
         num_heads: int = 4,
         dropout: float = 0.1,
-        max_write_tokens: int = 64,
         use_linear_attention: bool = True,
         use_checkpoint: bool = False,  # Gradient checkpointing for memory savings
         use_fixed_threshold: bool = True,  # Use fixed 0.5 threshold for gates
@@ -162,7 +162,6 @@ class UnifiedMemoryLayer(nn.Module):
         self.d_cache = d_cache
         self.num_slots = num_slots
         self.layer_idx = layer_idx
-        self.max_write_tokens = max_write_tokens
         self.use_checkpoint = use_checkpoint
         
         # === Core Components ===
@@ -187,20 +186,31 @@ class UnifiedMemoryLayer(nn.Module):
             use_linear_attention=use_linear_attention,
         )
         
-        # === Layer-Level Iteration Feedback (Thought Injection) ===
-        # Unlike model-level answer feedback, this injects the *previous iteration's
-        # hidden state* back into the current iteration. This is needed because:
-        # 1. Cache writes are gated/selective - not all information gets stored
-        # 2. Read/write don't happen every time (gating can be zero)
-        # 3. Provides direct gradient path for iteration-over-iteration learning
-        self.iteration_feedback_gate = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
-            nn.Sigmoid()
+        # NOTE: TRM uses simple additive injection (h = h + h_prev), no gate needed.
+        # The iteration feedback gate was removed as it adds complexity without benefit.
+        # Skip connections + simple addition provide sufficient gradient flow.
+        
+        # === Iteration Embeddings (Layer-level iteration awareness) ===
+        # Let the layer know which iteration it's on (how many times it's refined)
+        # max_iterations is typically 4-8
+        self.iteration_embeddings = nn.Embedding(16, d_model)  # Support up to 16 iterations
+        nn.init.normal_(self.iteration_embeddings.weight, mean=0.0, std=0.02)
+        
+        # === Per-Layer Halt Estimator ===
+        # Each layer has its own halting estimator because:
+        # 1. Different layers learn different representations (early=features, late=reasoning)
+        # 2. Each layer may need different amounts of refinement
+        # 3. Layer-specific patterns in when to halt
+        # Uses hidden state stability (no logits at layer level)
+        self.layer_halt_estimator = LayerHaltEstimator(
+            d_model=d_model,
+            layer_idx=layer_idx,
+            max_iterations=8,  # Will be overridden by max_iterations in forward
         )
         
-        # Optional: Confidence estimator for recursive refinement
-        # (Can be shared across layers or per-layer)
-        self.confidence_estimator = None  # Set externally if needed
+        # DEPRECATED: Old shared confidence estimator
+        # Keep for backward compatibility but mark for removal
+        self.confidence_estimator = None  # Set externally if using old API
         
         # === Cache Self-Attention (Memory Consolidation) ===
         # After each write, allow cache slots to attend to each other.
@@ -213,8 +223,7 @@ class UnifiedMemoryLayer(nn.Module):
         # - Confidence scores influence attention weights
         # - Layer ID enables cross-layer slot reasoning
         # - Temporal info (iter/pass) provides recency context
-        d_meta = 17  # Must match MemoryController: confidence(1) + temporal(16)
-        d_slot = d_cache + d_meta
+        d_slot = SLOT_DIMS.d_slot(d_cache)
         
         # Find largest valid num_heads that divides d_slot evenly
         # d_slot = 65 (48 + 17), so we need a divisor of 65: 1, 5, 13, 65
@@ -231,6 +240,31 @@ class UnifiedMemoryLayer(nn.Module):
             use_linear=True,  # Linear attention for efficiency
         )
     
+    def _compute_representation_entropy(self, h: torch.Tensor) -> torch.Tensor:
+        """
+        Compute entropy of hidden state distribution.
+        
+        Treats the hidden dimension as a distribution (via softmax) and 
+        computes entropy. High entropy = spread activations, low entropy = peaked.
+        
+        Changes in entropy between iterations indicate meaningful computation.
+        
+        Args:
+            h: Hidden state [B, S, D]
+            
+        Returns:
+            entropy: [B] mean entropy per sample
+        """
+        # Softmax over hidden dim to get "probability distribution"
+        p = F.softmax(h, dim=-1)  # [B, S, D]
+        
+        # Entropy: -sum(p * log(p))
+        log_p = torch.log(p + 1e-8)
+        entropy_per_position = -(p * log_p).sum(dim=-1)  # [B, S]
+        
+        # Mean over sequence positions
+        return entropy_per_position.mean(dim=-1)  # [B]
+    
     def forward(
         self,
         x: torch.Tensor,                       # [B, S, D_model]
@@ -243,6 +277,10 @@ class UnifiedMemoryLayer(nn.Module):
         confidence_threshold: float = 0.9,     # Early stopping threshold
         return_all_iterations: bool = False,   # Return intermediate states
         pass_idx: int = 0,                     # Current model-level pass (for temporal embedding)
+        # Centralized temporal embeddings (from model)
+        cache_layer_embed: Optional[nn.Embedding] = None,
+        cache_iter_embed: Optional[nn.Embedding] = None,
+        cache_pass_embed: Optional[nn.Embedding] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
         Forward pass with optional recursive refinement.
@@ -280,11 +318,13 @@ class UnifiedMemoryLayer(nn.Module):
             'confidence_count': 0,
             'iteration_feedback_sum': 0.0,
             'iteration_feedback_count': 0,
-            'iteration_feedback_gates': [],  # Tensor list for polarization loss
             'iterations_run': 0,
             # Gate tensors for polarization loss (stored with gradients)
             'read_gates': [],
             'write_gates': [],
+            # Layer-level entropy tracking for info gain
+            'layer_entropies': [],  # Entropy at each iteration
+            'layer_info_gains': [],  # Info gain between iterations
         }
         
         # Only store tensors if explicitly requested (for debugging)
@@ -295,23 +335,33 @@ class UnifiedMemoryLayer(nn.Module):
         h = x
         current_cache = cache
         h_prev = None  # Previous iteration's output for thought injection
+        h_prev_for_stability = None  # Previous h state for stability measurement
+        
+        # === INPUT INJECTION (TRM-style) ===
+        # Save original layer input for re-injection at each iteration
+        # This keeps the computation grounded to the original input
+        layer_input = x  # [B, S, D] - preserved for input injection + final skip
         
         # === Recursive Refinement Loop ===
         for iteration in range(max_iterations):
             aux['iterations_run'] += 1
             
-            # --- Step 0: THOUGHT INJECTION (from previous iteration) ---
-            # Inject previous iteration's output to provide direct feedback path.
-            # This complements cache (which is selective/gated) by providing
-            # full output continuity across iterations.
-            if iteration > 0 and h_prev is not None:
-                # Concatenate current state with previous, let gate decide how much to blend
-                gate_input = torch.cat([h, h_prev], dim=-1)
-                feedback_gate = self.iteration_feedback_gate(gate_input)
-                h = h + feedback_gate * h_prev  # Gated residual from previous iteration
-                aux['iteration_feedback_sum'] += feedback_gate.mean().detach().item()
+            # --- Step 0: ITERATION EMBEDDING + INPUT + THOUGHT INJECTION ---
+            # Add iteration embedding so layer knows which refinement step it's on
+            iter_emb = self.iteration_embeddings(
+                torch.tensor(iteration, device=x.device)
+            )  # [D_model]
+            h = h + iter_emb.unsqueeze(0).unsqueeze(0)  # [1, 1, D_model] broadcast
+            
+            # TRM-style input injection: add original input AND previous iteration output
+            if iteration > 0:
+                # Re-inject original input (like TRM's input_embeddings)
+                h = h + layer_input
+                # Also add previous iteration's output for iterative refinement
+                if h_prev is not None:
+                    h = h + h_prev
+                aux['iteration_feedback_sum'] += 1.0  # Track that injection happened
                 aux['iteration_feedback_count'] += 1
-                aux['iteration_feedback_gates'].append(feedback_gate.mean(dim=(1,2)))  # [B] avg gate
             
             # --- Step 1: MEMORY READ ---
             read_result = self.memory.read(
@@ -340,14 +390,16 @@ class UnifiedMemoryLayer(nn.Module):
                 h_computed = self.compute(h_enhanced, cos_sin=cos_sin)
             
             # --- Step 3: MEMORY WRITE ---
-            # Only write first max_write_tokens for efficiency
             write_result = self.memory.write(
                 h_computed, current_cache,
                 temperature=temperature,
                 hard=hard,
-                max_write_tokens=self.max_write_tokens,
                 iteration_idx=iteration,  # Current iteration within this layer
                 pass_idx=pass_idx,         # Current model-level pass
+                # Centralized temporal embeddings (from model)
+                cache_layer_embed=cache_layer_embed,
+                cache_iter_embed=cache_iter_embed,
+                cache_pass_embed=cache_pass_embed,
             )
             current_cache = write_result['updated_cache']
             aux['write_gate_sum'] += write_result['write_gate'].mean().detach().item()
@@ -372,48 +424,83 @@ class UnifiedMemoryLayer(nn.Module):
             current_cache = self.cache_self_attn(current_cache)
             
             # Update state - save for next iteration's thought injection
+            # IMPORTANT: Save h_prev BEFORE updating h, so stability measures actual change
+            h_prev_for_stability = h.detach()  # Previous h (before this iteration's compute)
             h = h_computed
-            h_prev = h_computed.detach()  # Detach to prevent gradient explosion
+            h_prev = h_computed.detach()  # For thought injection in NEXT iteration
+            
+            # --- Track Layer Entropy & Info Gain ---
+            # Compute entropy of hidden state distribution (treats h as logits over features)
+            # This measures "spread" of activations - productive iterations should change this
+            with torch.no_grad():
+                h_entropy = self._compute_representation_entropy(h)  # [B]
+                aux['layer_entropies'].append(h_entropy)
+                
+                # Compute info gain if we have previous entropy
+                if len(aux['layer_entropies']) > 1:
+                    prev_entropy = aux['layer_entropies'][-2]
+                    # Info gain = entropy reduction (becoming more certain)
+                    # Can also be negative if becoming less certain (exploring)
+                    info_gain = prev_entropy - h_entropy  # [B]
+                    aux['layer_info_gains'].append(info_gain)
             
             if return_all_iterations:
                 aux['all_outputs'].append(h.detach())
             
-            # --- Step 4: CONFIDENCE CHECK (for early stopping) ---
-            confidence_est = self.confidence_estimator
-            if max_iterations > 1 and confidence_est is not None:
-                confidence = confidence_est(h)
-                conf_val = confidence.mean().detach().item()
-                aux['confidence_sum'] += conf_val
-                aux['confidence_count'] += 1
-                
-                # Get learned halt threshold (budget + confidence aware)
-                # Threshold sees: h_pooled, confidence, iter_ratio, budget_remaining
-                # Low confidence + high budget → higher threshold (keep going)
-                # High confidence OR low budget → lower threshold (halt)
-                halt_threshold = confidence_est.get_layer_halt_threshold(
+            # --- Step 4: HALT CHECK (for early stopping) ---
+            # Uses info gain to decide if this layer should stop iterating.
+            # Halt when info_gain < threshold (not making progress)
+            # Each layer has its own halt estimator that learns layer-specific patterns.
+            if max_iterations > 1:
+                # Per-layer halt estimator (uses info gain + budget)
+                # Use h_prev_for_stability (state BEFORE this iteration) to measure change
+                info_gain, threshold = self.layer_halt_estimator(
                     h,
-                    confidence=confidence,  # No detach - allow gradient flow for learning
+                    h_prev=h_prev_for_stability,  # Compare to state BEFORE this iteration
                     current_iter=iteration,
                     max_iter=max_iterations,
                 )
-                threshold_val = halt_threshold.mean().detach().item()
+                
+                info_gain_val = info_gain.mean().detach().item()
+                threshold_val = threshold.mean().detach().item()
+                
+                aux['confidence_sum'] += info_gain_val  # info_gain = "confidence" for layers
+                aux['confidence_count'] += 1
                 aux['halt_threshold'] = threshold_val  # Scalar for debugging
                 
-                # Store threshold TENSOR (with gradients) for loss computation
+                # Store tensors (with gradients) for loss computation
                 if 'layer_halt_thresholds' not in aux:
                     aux['layer_halt_thresholds'] = []
-                aux['layer_halt_thresholds'].append(halt_threshold)  # [B] with gradients
+                aux['layer_halt_thresholds'].append(threshold)
                 
-                # Also store confidence tensor for layer-level threshold supervision
                 if 'layer_confidences' not in aux:
                     aux['layer_confidences'] = []
-                aux['layer_confidences'].append(confidence.detach())
+                aux['layer_confidences'].append(info_gain.detach())
                 
-                # Early stopping if confident enough (using learned threshold)
-                # During inference: always respect confidence
-                # During training: still allow halting (gradient flows through halt_threshold)
-                if conf_val > threshold_val:
-                    break
+                # Store info gains WITH gradients for divergence loss
+                # This allows backprop to encourage productive iterations
+                if 'layer_stabilities' not in aux:
+                    aux['layer_stabilities'] = []
+                aux['layer_stabilities'].append(info_gain)  # Keep gradients!
+                
+                # Early stopping: halt when info_gain < threshold (not making progress)
+                # Different from old logic which was stability > threshold
+                should_halt = info_gain_val < threshold_val
+                
+                if should_halt:
+                    if self.training:
+                        # ε-greedy exploration during training (30% chance to continue)
+                        # This ensures the model sees what happens with more iterations
+                        explore = torch.rand(1, device=h.device).item() < 0.3
+                        if not explore:
+                            break
+                    else:
+                        break
+        
+        # === SKIP CONNECTION: Add layer input to final output ===
+        # This ensures gradient flow even if iterations don't produce useful changes
+        # h = iteration_output + layer_input (dense residual)
+        h = h + layer_input
         
         # Aggregate auxiliary stats (already scalars)
         if aux['read_gate_count'] > 0:
@@ -421,7 +508,7 @@ class UnifiedMemoryLayer(nn.Module):
         if aux['write_gate_count'] > 0:
             aux['avg_write_gate'] = aux['write_gate_sum'] / aux['write_gate_count']
         if aux['iteration_feedback_count'] > 0:
-            aux['avg_iteration_feedback_gate'] = aux['iteration_feedback_sum'] / aux['iteration_feedback_count']
+            aux['avg_iteration_feedback'] = aux['iteration_feedback_sum'] / aux['iteration_feedback_count']
         if aux['confidence_count'] > 0:
             aux['avg_confidence'] = aux['confidence_sum'] / aux['confidence_count']
         

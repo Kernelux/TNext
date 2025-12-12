@@ -17,16 +17,26 @@ Presets:
     fast        - Quick training for iteration
     fast_full   - Same as train_recursive.py fast_full
     full        - Full model for best performance
-    trm         - TRM-style (H_cycles=4, L_cycles=6, pure TRM)
-    trm_minimal - TRM-style with fewer cycles (faster)
-    trm_deep    - TRM with more layers
+    trm         - TRM-style: more passes, single layer iteration
+    trm_minimal - TRM-style with fewer passes (faster)
+    trm_deep    - More layers with TRM-style refinement
+
+Halting Strategy (TRM-inspired Q-halt):
+- Q-halt head predicts: "Is the current answer correct?"
+- Trained with BCE against actual sequence correctness
+- Halt when: q_halt > 0 (model believes answer is correct)
+- Also tracks entropy/info_gain for analysis
+
+This is smarter than entropy-only halting because:
+- High confidence ≠ correct answer (model can be confidently wrong)
+- Direct supervision: correctness is what we actually care about
+- Model learns to recognize "what does a wrong answer look like?"
 """
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torch.amp import autocast, GradScaler
 from contextlib import nullcontext
 from tqdm import tqdm
 import os
@@ -45,6 +55,7 @@ from components import (
     compute_total_loss,
     AdamAtan2,
 )
+from components.logging import MetricsLogger, create_logger
 from components.miniarc_dataset import (
     MiniARCDataset,
     VOCAB_SIZE, MAX_SEQ_LEN, PAD_TOKEN, COLOR_OFFSET, MAX_GRID_SIZE,
@@ -307,8 +318,9 @@ def train_epoch(
     device: torch.device,
     config: TrainingConfig,
     global_step: int = 0,
-    writer: Optional[SummaryWriter] = None,
+    logger: Optional[MetricsLogger] = None,
     log_interval: int = 10,
+    force_max_passes: bool = False,  # Warmup mode
 ) -> Tuple[float, float, float, int]:
     """Training epoch."""
     model.train()
@@ -317,6 +329,8 @@ def train_epoch(
     total_cells = 0
     correct_tasks = 0
     total_tasks = 0
+    cell_acc = 0.0
+    task_acc = 0.0
     
     IGNORE_LABEL = -100
     
@@ -329,12 +343,13 @@ def train_epoch(
         
         optimizer.zero_grad()
         
-        # Forward pass
+        # Forward pass (with optional warmup mode)
         logits, cache, aux = model(
             demo_inputs, demo_outputs, test_input,
             config=config,
             step=global_step,
             return_aux=True,
+            force_max_passes=force_max_passes,  # Warmup: disable early halting
         )
         
         # Compute loss
@@ -378,61 +393,19 @@ def train_epoch(
         cell_acc = correct_cells / max(total_cells, 1)
         task_acc = correct_tasks / max(total_tasks, 1)
         
-        # TensorBoard logging
-        if writer is not None and batch_idx % log_interval == 0:
-            # === Loss Metrics ===
-            writer.add_scalar('Loss/total', metrics['loss_total'], global_step)
-            writer.add_scalar('Loss/task', metrics['loss_task'], global_step)
-            writer.add_scalar('Metrics/cell_accuracy', cell_acc, global_step)
-            writer.add_scalar('Metrics/task_accuracy', task_acc, global_step)
-            
-            # === Compute Statistics ===
-            passes = aux.get('passes_run', 1)
-            max_passes = config.max_passes
-            writer.add_scalar('Compute/model_passes', passes, global_step)
-            writer.add_scalar('Compute/pass_utilization', passes / max_passes, global_step)
-            
-            layer_iters = aux.get('layer_iterations', [])
-            if layer_iters:
-                avg_iters = sum(layer_iters) / len(layer_iters)
-                total_layer_steps = sum(layer_iters)
-                writer.add_scalar('Compute/avg_layer_iterations', avg_iters, global_step)
-                writer.add_scalar('Compute/total_layer_steps', total_layer_steps, global_step)
-                
-                # Total compute utilization
-                max_compute = max_passes * len(model.layers) * model.max_internal_iterations
-                writer.add_scalar('Compute/total_utilization', total_layer_steps / max(max_compute, 1), global_step)
-            
-            # === Feedback Gate Statistics ===
-            if aux.get('answer_feedback_count', 0) > 0:
-                avg_answer_fb = aux['answer_feedback_sum'] / aux['answer_feedback_count']
-                writer.add_scalar('Feedback/answer_gate_mean', avg_answer_fb, global_step)
-            
-            if aux.get('iteration_feedback_count', 0) > 0:
-                avg_iter_fb = aux['iteration_feedback_sum'] / aux['iteration_feedback_count']
-                writer.add_scalar('Feedback/iteration_gate_mean', avg_iter_fb, global_step)
-            
-            # === Memory Gate Statistics ===
-            if aux.get('read_gate_count', 0) > 0:
-                avg_read = aux['read_gate_sum'] / aux['read_gate_count']
-                writer.add_scalar('Gates/read_mean', avg_read, global_step)
-            if aux.get('write_gate_count', 0) > 0:
-                avg_write = aux['write_gate_sum'] / aux['write_gate_count']
-                writer.add_scalar('Gates/write_mean', avg_write, global_step)
-            
-            # === Confidence Tracking ===
-            pass_confs = aux.get('pass_confidences', [])
-            if pass_confs:
-                for i, conf in enumerate(pass_confs):
-                    writer.add_scalar(f'Confidence/pass_{i}', conf.mean().item(), global_step)
-                writer.add_scalar('Confidence/final', pass_confs[-1].mean().item(), global_step)
-            
-            # === Temperature ===
-            temp = aux.get('temperature', config.get_temperature(global_step))
-            writer.add_scalar('Training/temperature', temp, global_step)
+        # TensorBoard logging (using MetricsLogger)
+        if logger is not None and batch_idx % log_interval == 0:
+            logger.log_step(
+                step=global_step,
+                metrics=metrics,
+                aux=aux,
+                config=config,
+                cell_acc=cell_acc,
+                task_acc=task_acc,
+            )
         
         # Visualization and Image Logging
-        if writer is not None and global_step % 50 == 0:
+        if logger is not None and global_step % 50 == 0:
             viz_str = visualize_sample(
                 demo_inputs=demo_inputs[0],
                 demo_outputs=demo_outputs[0],
@@ -455,7 +428,7 @@ def train_epoch(
                     prediction=preds[0],
                 )
                 sample_img_chw = np.transpose(sample_img, (2, 0, 1)).astype(np.float32) / 255.0
-                writer.add_image('Samples/prediction', sample_img_chw, global_step)
+                logger.log_image('Samples/prediction', sample_img_chw, global_step)
             except Exception as e:
                 print(f"[Warning] Image logging failed: {e}")
         
@@ -500,6 +473,8 @@ def evaluate(
     correct_cells = 0
     total_cells = 0
     samples_visualized = 0
+    cell_acc = 0.0
+    task_acc = 0.0
     
     IGNORE_LABEL = -100
     
@@ -630,8 +605,8 @@ def main():
         d_model, d_cache = 64, 48
         num_layers, num_slots, num_heads = 4, 32, 2
         batch_size = 8
-        max_passes = 3
-        max_layer_iters = 3
+        max_passes = 1
+        max_layer_iters = 10
         num_epochs = 100
     elif preset_name == "trm":
         # TRM-inspired: More passes, single layer iteration (pure recursive style)
@@ -727,21 +702,27 @@ def main():
     # Logging
     log_dir = Path("logs") / f"miniarc_{preset_name}_{time.strftime('%Y%m%d_%H%M%S')}"
     writer = SummaryWriter(log_dir)
+    logger = MetricsLogger(writer)
     print(f"TensorBoard logs: {log_dir}")
     
     # Training loop
     best_task_acc = 0
     global_step = 0
+    warmup_epochs = getattr(config, 'warmup_epochs', 1)  # Default 1 warmup epoch
     
     for epoch in range(num_epochs):
+        # Warmup mode: force max passes to stabilize Q-halt learning
+        is_warmup = epoch < warmup_epochs
+        if is_warmup:
+            print(f"[Warmup Epoch {epoch+1}/{warmup_epochs}] Forcing max passes (no early halt)")
+        
         train_loss, train_cell_acc, train_task_acc, global_step = train_epoch(
             model, train_loader, optimizer, device, config, global_step,
-            writer=writer, log_interval=10,
+            logger=logger, log_interval=10,
+            force_max_passes=is_warmup,  # Warmup: disable early halting
         )
         
-        writer.add_scalar('Epoch/train_loss', train_loss, epoch)
-        writer.add_scalar('Epoch/train_cell_acc', train_cell_acc, epoch)
-        writer.add_scalar('Epoch/train_task_acc', train_task_acc, epoch)
+        logger.log_epoch(epoch, train_loss, train_cell_acc, train_task_acc)
         
         # Evaluate every 5 epochs
         if (epoch + 1) % 5 == 0:
@@ -754,14 +735,14 @@ def main():
                 best_task_acc = eval_task_acc
                 torch.save(model.state_dict(), log_dir / "best_model.pt")
             
-            writer.add_scalar('Epoch/eval_cell_acc', eval_cell_acc, epoch)
-            writer.add_scalar('Epoch/eval_task_acc', eval_task_acc, epoch)
+            logger.log_epoch(epoch, train_loss, train_cell_acc, train_task_acc,
+                             eval_cell_acc=eval_cell_acc, eval_task_acc=eval_task_acc)
             
             print(f"Epoch {epoch+1:3d} | Loss: {train_loss:.4f} | Eval Task: {eval_task_acc:.3f} | Best: {best_task_acc:.3f}")
         else:
             print(f"Epoch {epoch+1:3d} | Loss: {train_loss:.4f} | Train Task: {train_task_acc:.3f}")
     
-    writer.close()
+    logger.close()
     print(f"\nTraining complete. Best task accuracy: {best_task_acc:.3f}")
 
 
