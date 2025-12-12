@@ -602,10 +602,9 @@ def main():
     # Model configuration per preset
     # Mini-ARC needs smaller models due to simpler tasks and less data
     # 
-    # TRM-style parameters:
-    #   trm_outer_cycles: H_cycles - high-level refinement passes
-    #   trm_inner_cycles: L_cycles - full stack repetitions per outer cycle
-    #   max_internal_iterations: Per-layer ACT pondering (our addition, 1 = pure TRM)
+    # Recursive refinement parameters:
+    #   max_passes: Model-level refinement passes (whole model iterates)
+    #   max_layer_iters: Per-layer ACT pondering (within-layer iterations)
     #
     # Default learning rate (can be overridden per-preset)
     lr = 5e-4
@@ -615,68 +614,59 @@ def main():
         d_model, d_cache = 32, 24
         num_layers, num_slots, num_heads = 2, 8, 2
         batch_size = 16
-        trm_outer_cycles, trm_inner_cycles = 2, 2
-        max_internal_iterations = 2
+        max_passes = 2
+        max_layer_iters = 2
         num_epochs = 10
     elif preset_name == "fast":
         # Quick training for iteration
         d_model, d_cache = 64, 48
         num_layers, num_slots, num_heads = 3, 16, 2
         batch_size = 32
-        trm_outer_cycles, trm_inner_cycles = 3, 2
-        max_internal_iterations = 3
+        max_passes = 3
+        max_layer_iters = 3
         num_epochs = 50
     elif preset_name == "fast_full":
         # Same as train_recursive.py fast_full - for comparison
         d_model, d_cache = 64, 48
         num_layers, num_slots, num_heads = 4, 32, 2
         batch_size = 8
-        trm_outer_cycles, trm_inner_cycles = 3, 2  # TRM-style cycles
-        max_internal_iterations = 3  # Per-layer pondering
+        max_passes = 3
+        max_layer_iters = 3
         num_epochs = 100
     elif preset_name == "trm":
-        # TRM-style: Matches TinyRecursiveModels architecture + our Memory Cache
-        # Key TRM insights implemented:
-        #   - z_H/z_L start from learned constants (H_init/L_init), NOT input embeddings
-        #   - Input only enters via context injection: z_L = layers(z_L + (z_H + input))
-        #   - z_H updates from z_L once per outer cycle: z_H = layers(z_H + z_L)
-        #   - No-grad for H_cycles-1, only last outer cycle has gradients
+        # TRM-inspired: More passes, single layer iteration (pure recursive style)
         d_model, d_cache = 64, 48
         num_layers, num_slots, num_heads = 4, 32, 2
         batch_size = 16
-        trm_outer_cycles = 4   # TRM's H_cycles (default in TRM is 4)
-        trm_inner_cycles = 6   # TRM's L_cycles (default in TRM is 6)
-        max_internal_iterations = 1  # No per-layer pondering (pure TRM style)
+        max_passes = 4
+        max_layer_iters = 1  # No per-layer pondering (TRM style)
         num_epochs = 100
-        lr = 3e-4  # Lower LR for TRM stability
+        lr = 3e-4
     elif preset_name == "trm_minimal":
-        # TRM-style but with minimal cycles for faster iteration
-        # Good for debugging TRM architecture without long training times
+        # Minimal TRM-style for faster iteration
         d_model, d_cache = 64, 48
         num_layers, num_slots, num_heads = 4, 32, 2
         batch_size = 16
-        trm_outer_cycles = 2   # Fewer outer cycles (still needs at least 2 for z_H updates)
-        trm_inner_cycles = 3   # Fewer inner cycles
-        max_internal_iterations = 1  # No per-layer pondering
+        max_passes = 2
+        max_layer_iters = 1
         num_epochs = 50
-        lr = 3e-4  # Lower LR for TRM stability
+        lr = 3e-4
     elif preset_name == "trm_deep":
-        # TRM with more layers - tests if depth helps Mini-ARC
+        # More layers with TRM-style refinement
         d_model, d_cache = 64, 48
         num_layers, num_slots, num_heads = 6, 32, 2  # More layers
         batch_size = 16
-        trm_outer_cycles = 3
-        trm_inner_cycles = 4
-        max_internal_iterations = 1
+        max_passes = 3
+        max_layer_iters = 1
         num_epochs = 100
-        lr = 3e-4  # Lower LR for TRM stability
+        lr = 3e-4
     else:  # full
         # Full model for best performance
         d_model, d_cache = 128, 64
         num_layers, num_slots, num_heads = 4, 32, 4
         batch_size = 16
-        trm_outer_cycles, trm_inner_cycles = 4, 3
-        max_internal_iterations = 4
+        max_passes = 4
+        max_layer_iters = 4
         num_epochs = 100
     
     # Dataset
@@ -696,20 +686,20 @@ def main():
     print(f"\nTrain samples: {len(train_dataset)}, Eval samples: {len(eval_dataset)}")
     print(f"Sequence length: {MAX_SEQ_LEN} tokens (vs 900 for ARC-AGI-2)")
     print(f"Speedup: ~{900 // MAX_SEQ_LEN}x faster per sample")
-    print(f"TRM cycles: outer={trm_outer_cycles}, inner={trm_inner_cycles}, layer_iter={max_internal_iterations}")
+    print(f"Refinement: max_passes={max_passes}, max_layer_iters={max_layer_iters}")
     
-    # Config - use trm_outer_cycles as max_passes for backward compatibility
+    # Training config
     config = TrainingConfig(
         tau_start=1.0,
         tau_min=0.1,
-        max_passes=trm_outer_cycles,  # Maps to trm_outer_cycles
-        max_recurrent_steps=max_internal_iterations,
+        max_passes=max_passes,
+        max_recurrent_steps=max_layer_iters,
         features=features,
         lambda_step_efficiency=0.02,
         lambda_diversity=0.01,
     )
     
-    # Model - use Mini-ARC's smaller vocab and sequence length
+    # Model
     model = RecursiveRefinementModel(
         vocab_size=VOCAB_SIZE,
         d_model=d_model,
@@ -718,15 +708,10 @@ def main():
         num_slots=num_slots,
         num_heads=num_heads,
         max_seq_len=MAX_SEQ_LEN,
-        # TRM-style cycle parameters
-        trm_outer_cycles=trm_outer_cycles,
-        trm_inner_cycles=trm_inner_cycles,
-        max_internal_iterations=max_internal_iterations,
+        max_passes=max_passes,
+        max_internal_iterations=max_layer_iters,
         dropout=0.0,
         confidence_threshold=0.8,
-        use_fixed_gate_threshold=config.use_fixed_gate_threshold,
-        fixed_gate_threshold=config.gate_threshold,
-        use_hippo_init=features.use_hippo_init,
     ).to(device)
     
     print_model_summary(model)
