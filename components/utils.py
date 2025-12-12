@@ -200,3 +200,165 @@ class EMA:
             if param.requires_grad:
                 param.data = self.backup[name]
         self.backup = {}
+
+
+# ============================================================================
+# HiPPO Initialization
+# ============================================================================
+# 
+# HiPPO (High-order Polynomial Projection Operators) provides mathematically
+# grounded initialization for state space models and memory systems.
+# 
+# Key insight: Initialize state transition matrices to compress input history
+# optimally, with recent inputs weighted more than older ones.
+#
+# Reference: "HiPPO: Recurrent Memory with Optimal Polynomial Projections" (2020)
+# Also used in S4, S4D, and Mamba architectures.
+# ============================================================================
+
+def make_hippo_legs_matrix(N: int) -> torch.Tensor:
+    """
+    Create the HiPPO-LegS (Scaled Legendre) matrix.
+    
+    This is the "HiPPO matrix" used in S4 and Mamba. It creates a state
+    transition matrix that optimally compresses the input history using
+    Legendre polynomial basis functions.
+    
+    Properties:
+    - Lower triangular (causal)
+    - Diagonal elements: n+1 (decay rate increases with state index)
+    - Below diagonal: sqrt((2n+1)(2k+1)) for n > k
+    
+    The matrix captures all past inputs with recent inputs weighted more
+    strongly (decaying memory with Legendre polynomial basis).
+    
+    Args:
+        N: State dimension (number of coefficients to track)
+        
+    Returns:
+        A: [N, N] HiPPO-LegS matrix
+    """
+    # Build the A matrix
+    # A_nk = (2n+1)^0.5 * (2k+1)^0.5  if n > k
+    #      = n + 1                    if n = k  
+    #      = 0                        if n < k
+    
+    A = torch.zeros(N, N)
+    for n in range(N):
+        for k in range(N):
+            if n > k:
+                A[n, k] = math.sqrt((2*n + 1) * (2*k + 1))
+            elif n == k:
+                A[n, k] = n + 1
+            # else: 0 (upper triangular part)
+    
+    return A
+
+
+def make_hippo_legs_b(N: int) -> torch.Tensor:
+    """
+    Create the HiPPO-LegS input matrix B.
+    
+    B_n = sqrt(2n + 1)
+    
+    This weights how much each Legendre coefficient is influenced by new input.
+    Higher-order coefficients (capturing faster variations) get larger weights.
+    
+    Args:
+        N: State dimension
+        
+    Returns:
+        B: [N, 1] input weight vector
+    """
+    B = torch.zeros(N, 1)
+    for n in range(N):
+        B[n, 0] = math.sqrt(2*n + 1)
+    return B
+
+
+def init_hippo_legs(weight: torch.Tensor, dt: float = 1.0):
+    """
+    Initialize a weight matrix using discretized HiPPO-LegS.
+    
+    For a state update: h_{k+1} = A_bar @ h_k + B_bar @ x_k
+    
+    Using forward Euler discretization:
+        A_bar = I - dt * A
+        B_bar = dt * B
+    
+    This initialization is ideal for:
+    - Cache/memory slot state transitions
+    - Recurrent state matrices
+    - Any matrix that should "remember" history optimally
+    
+    Args:
+        weight: [N, N] weight tensor to initialize in-place
+        dt: Discretization step size (smaller = finer granularity)
+    """
+    N = weight.shape[0]
+    assert weight.shape[1] == N, "HiPPO init requires square matrix"
+    
+    A = make_hippo_legs_matrix(N)
+    
+    # Forward Euler discretization: A_bar = I - dt * A
+    # Note: We use negative A because HiPPO defines dh/dt = -A @ h + B @ x
+    A_bar = torch.eye(N) - dt * A
+    
+    with torch.no_grad():
+        weight.copy_(A_bar)
+
+
+def init_hippo_diagonal(weight: torch.Tensor, dt: float = 1.0):
+    """
+    Initialize a weight matrix using HiPPO diagonal approximation (S4D-style).
+    
+    S4D showed that using just the diagonal of HiPPO works surprisingly well
+    and is much more efficient. This is what Mamba uses.
+    
+    Diagonal elements: -1, -2, -3, ..., -N (after discretization: 1-dt, 1-2dt, ...)
+    
+    Args:
+        weight: [N, N] weight tensor to initialize (only diagonal set)
+        dt: Discretization step size
+    """
+    N = weight.shape[0]
+    
+    with torch.no_grad():
+        weight.zero_()
+        for n in range(N):
+            # Diagonal of HiPPO-LegS is -(n+1)
+            # Discretized: 1 - dt * (n+1)
+            weight[n, n] = 1.0 - dt * (n + 1)
+
+
+def init_hippo_embedding(embedding: torch.Tensor, dt: float = 0.1):
+    """
+    Initialize embeddings using HiPPO-inspired basis functions.
+    
+    Each row of the embedding is initialized to capture different
+    "frequencies" of the input, similar to how Legendre polynomials
+    capture different scales of variation.
+    
+    This is useful for:
+    - Slot embeddings (memory cache initialization)
+    - Position encodings
+    - Any embedding that should represent temporal/sequential structure
+    
+    Args:
+        embedding: [num_embeddings, dim] tensor to initialize
+        dt: Effective "time scale" for the basis functions
+    """
+    num_embeddings, dim = embedding.shape
+    
+    # Use HiPPO B vector scaled appropriately
+    # Each embedding row corresponds to a different "time" in the past
+    B = make_hippo_legs_b(dim)  # [dim, 1]
+    
+    with torch.no_grad():
+        for i in range(num_embeddings):
+            # Scale factor: later embeddings (higher i) represent "older" memories
+            # Older memories get exponentially decayed
+            scale = math.exp(-dt * i)
+            # Each embedding is a scaled version of the B vector plus small noise
+            embedding[i] = B.squeeze() * scale + torch.randn(dim) * 0.01
+

@@ -42,6 +42,7 @@ class FeatureFlags:
     # Routing improvements
     use_gumbel_softmax: bool = True     # False = argmax routing (non-differentiable)
     use_slot_embeddings: bool = True    # False = zero-init cache
+    use_hippo_init: bool = True         # Use HiPPO initialization for slot embeddings (better long-range memory)
     use_hybrid_routing: bool = False    # False = learned routing only (RECOMMENDED DEFAULT)
                                         # True = add content-based similarity (only if needed)
     use_layer_id: bool = True           # False = no layer separation in cache
@@ -84,6 +85,8 @@ class FeatureFlags:
     deep_supervision_decay: float = 0.8  # Weight decay for earlier passes (later = more important)
     use_ponder_cost: bool = True         # Penalize using more passes than needed
     ponder_cost_weight: float = 0.01     # Weight of ponder cost in total loss
+    use_inner_loop_halting: bool = True  # Allow early exit from inner (L_cycles) loop based on confidence
+                                         # TRM doesn't do this, but it can save compute
 
     # === POSITION ENCODING (TRM insight: RoPE saves params) ===
     # Options: "rope" (zero params), "learned" (heavy ~1.6M), "none"
@@ -99,6 +102,7 @@ class FeatureFlags:
         improvements = []
         if self.use_gumbel_softmax: improvements.append("gumbel")
         if self.use_slot_embeddings: improvements.append("slot-emb")
+        if self.use_hippo_init: improvements.append("hippo")
         if self.use_hybrid_routing: improvements.append("hybrid")
         if self.use_layer_id: improvements.append("layer-id")
         if self.use_cache_self_attn: improvements.append("cache-attn")
@@ -120,6 +124,7 @@ class FeatureFlags:
         if self.no_act_continue: trm.append("no-q-cont")  # Paper recommends this
         # refinement_read removed
         if self.use_gradient_free_passes: trm.append("no-grad")
+        if self.use_inner_loop_halting: trm.append("inner-halt")
 
         return (f"Core: [{', '.join(core)}] | "
                 f"Improvements: [{', '.join(improvements)}] | "
@@ -185,6 +190,97 @@ FEATURE_PRESETS = {
         use_diversity_loss=True,     # Keep diversity to prevent slot collapse
         use_answer_feedback=True,    # Keep answer feedback mechanism
     ),
+
+    # TRM-style: Model passes + Memory Cache, NO layer iterations
+    # Combines TinyRecursiveModels approach with our global cache
+    # - Multiple model passes (TRM's H_cycles equivalent)
+    # - Memory cache with read/write gates (our contribution)
+    # - NO layer-level ACT iterations (TRM doesn't use this)
+    # - Deep supervision on all passes
+    # - Answer feedback for refinement
+    "trm": FeatureFlags(
+        # Core: Keep cache and multi-pass
+        use_cache=True,
+        use_selection_head=True,
+        use_multi_pass=True,
+        
+        # Model-level halting: YES
+        use_act_halting=True,           # Multiple passes with adaptive halting
+        
+        # Layer-level iterations: NO (TRM-style)
+        use_layer_act=False,            # KEY: No pondering inside layers!
+        
+        # Memory improvements: Keep all
+        use_gumbel_softmax=True,
+        use_slot_embeddings=True,
+        use_hippo_init=True,
+        use_layer_id=True,
+        use_cache_self_attn=True,       # Cache consolidation between passes
+        use_gated_fusion=True,
+        use_moe_memory=True,            # Read/write gates
+        use_cache_informed_write=True,
+        use_linear_attention=True,
+        
+        # Refinements: Keep useful ones
+        use_write_count_masking=True,
+        use_temporal_decay=True,
+        use_noise_injection=True,
+        use_soft_wta_update=True,
+        
+        # TRM insights: All enabled
+        use_deep_supervision=True,      # Loss at every pass
+        use_answer_feedback=True,       # Key TRM insight
+        no_act_continue=True,           # Paper recommends
+        
+        # Losses
+        use_diversity_loss=True,
+        use_ponder_cost=True,           # Penalize unnecessary passes
+        
+        # Position encoding
+        pos_encoding="rope",
+    ),
+
+    # TRM-minimal: Same as TRM but with minimal features for comparison
+    "trm_minimal": FeatureFlags(
+        # Core only
+        use_cache=True,
+        use_selection_head=True,
+        use_multi_pass=True,
+        
+        # Model-level halting: YES
+        use_act_halting=True,
+        
+        # Layer-level iterations: NO
+        use_layer_act=False,
+        
+        # Minimal memory features
+        use_gumbel_softmax=True,
+        use_slot_embeddings=True,
+        use_hippo_init=True,
+        use_layer_id=False,
+        use_cache_self_attn=False,      # No cache attention
+        use_gated_fusion=False,
+        use_moe_memory=True,            # Keep read/write gates
+        use_cache_informed_write=False,
+        use_linear_attention=True,
+        
+        # Minimal refinements
+        use_write_count_masking=True,
+        use_temporal_decay=False,
+        use_noise_injection=False,
+        use_soft_wta_update=False,
+        
+        # TRM insights
+        use_deep_supervision=True,
+        use_answer_feedback=True,
+        no_act_continue=True,
+        
+        # Losses
+        use_diversity_loss=False,
+        use_ponder_cost=True,
+        
+        pos_encoding="rope",
+    ),
 }
 
 
@@ -217,13 +313,26 @@ class TrainingConfig:
     lambda_q_head: float = 0.1       # Q-head correctness predictor (pass-level halting)
     lambda_step_efficiency: float = 0.5  # Layer-level step efficiency
     
-    # Loss weights - Confidence-based (NEW)
-    lambda_confidence_calibration: float = 0.5   # Align confidence with actual correctness
+    # Loss weights - Confidence-based
+    lambda_confidence_calibration: float = 1.0   # Align confidence with actual correctness (was 0.5)
     lambda_halt_prediction: float = 0.3          # Train halt to predict sequence correctness
     lambda_confidence_monotonicity: float = 0.1  # Later passes should have higher confidence
+    
+    # Loss weights - Gate Regularization
+    lambda_gate_polar: float = 0.1               # Gate polarization (push away from 0.5)
+    lambda_gate_sparsity: float = 0.1            # Gate sparsity (target activation ratios)
+    lambda_feedback_polar: float = 0.1           # Feedback gate polarization (answer/iteration gates)
 
-    # Importance threshold
-    write_threshold: float = 0.5
+    # Gate thresholds - Fixed vs Learned
+    # Fixed thresholds are simpler and force gates to be decisive (polarize to 0 or 1)
+    # The gate VALUE becomes the decision, threshold is just the cutoff
+    use_fixed_gate_threshold: bool = True        # True = fixed 0.5, False = learned per-token
+    gate_threshold: float = 0.5                  # Fixed threshold for read/write gates
+    
+    # Halt thresholds - for confidence-based early stopping
+    # These are different from gate thresholds - they involve compute budget
+    use_fixed_halt_threshold: bool = True        # True = fixed confidence threshold
+    halt_confidence_threshold: float = 0.8       # Stop iterating when confidence > this
 
     # Hybrid routing
     alpha_learned: float = 1.0  # 1.0 = pure learned routing

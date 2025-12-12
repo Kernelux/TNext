@@ -50,6 +50,46 @@ def compute_gate_polarization_loss(
     return polar_loss.mean()
 
 
+def compute_feedback_gate_polarization_loss(
+    aux_info: Dict,
+) -> torch.Tensor:
+    """
+    Feedback Gate Polarization Loss - encourages answer/iteration gates to be decisive.
+    
+    These feedback gates control:
+    - answer_feedback: How much to inject answer prototype back into processing
+    - iteration_feedback: How much to inject layer thoughts between iterations
+    
+    If these stay at ~0.5, the model can't learn to selectively use feedback.
+    This loss pushes them toward 0 or 1 for decisive behavior.
+    
+    L_polar = 4 * g * (1 - g)  (same formula as memory gates)
+    """
+    all_gates = []
+    
+    # Collect answer feedback gate tensors
+    answer_gates = aux_info.get('answer_feedback_gates', [])
+    for g in answer_gates:
+        if g is not None and isinstance(g, torch.Tensor) and g.numel() > 0:
+            all_gates.append(g.view(-1))
+    
+    # Collect iteration feedback gate tensors
+    iter_gates = aux_info.get('iteration_feedback_gates', [])
+    for g in iter_gates:
+        if g is not None and isinstance(g, torch.Tensor) and g.numel() > 0:
+            all_gates.append(g.view(-1))
+    
+    if not all_gates:
+        return torch.tensor(0.0)
+    
+    gates = torch.cat(all_gates)
+    
+    # Same polarization formula: maximum at 0.5, minimum at 0 or 1
+    polar_loss = 4.0 * gates * (1.0 - gates)
+    
+    return polar_loss.mean()
+
+
 def compute_read_gate_sparsity_loss(
     read_gates: List[torch.Tensor],
     write_gates: List[torch.Tensor],
@@ -236,6 +276,10 @@ def compute_confidence_calibration_loss(
     
     # Use final logits
     final_logits = pass_logits[-1]  # [B, S, V]
+    
+    # NaN protection - if logits are NaN, skip this loss
+    if torch.isnan(final_logits).any() or torch.isnan(final_confidence).any():
+        return torch.tensor(0.0, device=device)
     
     # Compute per-position correctness (ground truth for confidence)
     valid_mask = (test_output != IGNORE_LABEL)  # [B, S]
@@ -637,6 +681,10 @@ def compute_task_loss(
     """
     device = logits.device
     
+    # NaN protection - if logits are NaN, return a large but finite loss
+    if torch.isnan(logits).any():
+        return torch.tensor(10.0, device=device, requires_grad=True)
+    
     # If using deep supervision, average loss across all passes
     logits_to_process = pass_logits_list if pass_logits_list else [logits]
     
@@ -958,11 +1006,14 @@ def compute_total_loss(
             write_target_ratio=0.3
         )
 
+    # 13. Feedback Gate Polarization (answer/iteration gates)
+    feedback_polar_loss = compute_feedback_gate_polarization_loss(aux_info)
+
     # === LOSS WEIGHTING ===
     # Use config weights where available, sensible defaults otherwise
     
-    # Confidence-based losses (new)
-    lambda_conf_calib = getattr(config, 'lambda_confidence_calibration', 0.5)
+    # Confidence-based losses
+    lambda_conf_calib = getattr(config, 'lambda_confidence_calibration', 1.0)  # Increased from 0.5
     lambda_halt_pred = getattr(config, 'lambda_halt_prediction', 0.3)
     lambda_conf_mono = getattr(config, 'lambda_confidence_monotonicity', 0.1)
     lambda_threshold = getattr(config, 'lambda_threshold_supervision', 0.2)
@@ -987,8 +1038,15 @@ def compute_total_loss(
     # Gradient flow losses
     gradient_flow_loss = output_entropy_loss + 0.05 * pred_diversity_loss
     
-    # Gate regularization
-    gate_loss = 0.01 * gate_polar_loss + 0.1 * gate_sparsity_loss
+    # Gate regularization - use config weights
+    lambda_gate_polar = getattr(config, 'lambda_gate_polar', 0.1)
+    lambda_gate_sparsity = getattr(config, 'lambda_gate_sparsity', 0.1)
+    lambda_feedback_polar = getattr(config, 'lambda_feedback_polar', 0.1)
+    gate_loss = (
+        lambda_gate_polar * gate_polar_loss + 
+        lambda_gate_sparsity * gate_sparsity_loss +
+        lambda_feedback_polar * feedback_polar_loss
+    )
 
     # Total loss
     total_loss = (
@@ -1029,6 +1087,7 @@ def compute_total_loss(
         'loss_pred_diversity': _to_scalar(pred_diversity_loss),
         'loss_gate_polar': _to_scalar(gate_polar_loss),
         'loss_gate_sparsity': _to_scalar(gate_sparsity_loss),
+        'loss_feedback_polar': _to_scalar(feedback_polar_loss),
     }
 
     return total_loss, metrics

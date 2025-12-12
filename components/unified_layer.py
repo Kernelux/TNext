@@ -154,6 +154,8 @@ class UnifiedMemoryLayer(nn.Module):
         max_write_tokens: int = 64,
         use_linear_attention: bool = True,
         use_checkpoint: bool = False,  # Gradient checkpointing for memory savings
+        use_fixed_threshold: bool = True,  # Use fixed 0.5 threshold for gates
+        fixed_threshold: float = 0.5,       # Fixed threshold value
     ):
         super().__init__()
         self.d_model = d_model
@@ -173,6 +175,8 @@ class UnifiedMemoryLayer(nn.Module):
             num_layers=num_layers,
             layer_idx=layer_idx,
             dropout=dropout,
+            use_fixed_threshold=use_fixed_threshold,
+            fixed_threshold=fixed_threshold,
         )
         
         # Compute Block (handles all computation)
@@ -276,7 +280,11 @@ class UnifiedMemoryLayer(nn.Module):
             'confidence_count': 0,
             'iteration_feedback_sum': 0.0,
             'iteration_feedback_count': 0,
+            'iteration_feedback_gates': [],  # Tensor list for polarization loss
             'iterations_run': 0,
+            # Gate tensors for polarization loss (stored with gradients)
+            'read_gates': [],
+            'write_gates': [],
         }
         
         # Only store tensors if explicitly requested (for debugging)
@@ -303,6 +311,7 @@ class UnifiedMemoryLayer(nn.Module):
                 h = h + feedback_gate * h_prev  # Gated residual from previous iteration
                 aux['iteration_feedback_sum'] += feedback_gate.mean().detach().item()
                 aux['iteration_feedback_count'] += 1
+                aux['iteration_feedback_gates'].append(feedback_gate.mean(dim=(1,2)))  # [B] avg gate
             
             # --- Step 1: MEMORY READ ---
             read_result = self.memory.read(
@@ -313,6 +322,8 @@ class UnifiedMemoryLayer(nn.Module):
             h_enhanced = read_result['x_enhanced']
             aux['read_gate_sum'] += read_result['read_gate'].mean().detach().item()
             aux['read_gate_count'] += 1
+            # Store SOFT gate tensor for polarization loss (pre-threshold, with gradients)
+            aux['read_gates'].append(read_result['soft_read_gate'])
             
             # Store read threshold tensor (for gradient flow to threshold network)
             if 'read_thresholds' not in aux:
@@ -341,6 +352,8 @@ class UnifiedMemoryLayer(nn.Module):
             current_cache = write_result['updated_cache']
             aux['write_gate_sum'] += write_result['write_gate'].mean().detach().item()
             aux['write_gate_count'] += 1
+            # Store SOFT gate tensor for polarization loss (pre-threshold, with gradients)
+            aux['write_gates'].append(write_result['soft_write_gate'])
             
             # Store write threshold tensor (for gradient flow to threshold network)
             if 'write_thresholds' not in aux:

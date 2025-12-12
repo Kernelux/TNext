@@ -94,6 +94,8 @@ class MemoryController(nn.Module):
         num_layers: Total layers (for global cache indexing)
         layer_idx:  This layer's index (for local cache access)
         dropout:    Dropout probability
+        use_fixed_threshold: Use fixed 0.5 threshold instead of learned
+        fixed_threshold: Value for fixed threshold (default 0.5)
     """
 
     def __init__(
@@ -106,6 +108,8 @@ class MemoryController(nn.Module):
         dropout: float = 0.1,
         max_iterations: int = 4,  # For temporal embeddings
         max_passes: int = 6,      # For temporal embeddings
+        use_fixed_threshold: bool = True,  # NEW: Use fixed 0.5 instead of learned
+        fixed_threshold: float = 0.5,      # NEW: Fixed threshold value
     ):
         super().__init__()
         self.d_model = d_model
@@ -114,6 +118,8 @@ class MemoryController(nn.Module):
         self.num_layers = num_layers
         self.layer_idx = layer_idx
         self.total_slots = num_layers * num_slots
+        self.use_fixed_threshold = use_fixed_threshold
+        self.fixed_threshold = fixed_threshold
         
         # === Slot Metadata Dimensions ===
         # Metadata stored alongside content: [content (d_cache) | metadata (d_meta)]
@@ -370,8 +376,14 @@ class MemoryController(nn.Module):
         gate_logit = self.read_gate(x)  # [B, S, 1]
         soft_gate = torch.sigmoid(gate_logit)
         
-        # Learned context-dependent threshold
-        read_thresh = self.read_threshold(x)  # [B, S, 1] in [0, 1]
+        # Threshold: fixed or learned
+        if self.use_fixed_threshold:
+            # Fixed threshold - forces gate VALUES to be decisive
+            # Polarization loss will push soft_gate to 0 or 1
+            read_thresh = torch.full_like(soft_gate, self.fixed_threshold)
+        else:
+            # Learned context-dependent threshold
+            read_thresh = self.read_threshold(x)  # [B, S, 1] in [0, 1]
 
         if hard or not self.training:
             read_gate = (soft_gate > read_thresh).float()
@@ -407,6 +419,7 @@ class MemoryController(nn.Module):
             'x_enhanced': x_enhanced,
             'context': context,
             'read_gate': read_gate,
+            'soft_read_gate': soft_gate,  # For polarization loss (pre-threshold)
             'read_threshold': read_thresh,  # Include threshold tensor for gradient flow
             'attn_weights': attn_weights,
         }
@@ -473,9 +486,15 @@ class MemoryController(nn.Module):
         decision_logit = self.write_decision(combined)  # [B, T, 1]
         soft_decision = torch.sigmoid(decision_logit)
         
-        # Learned context-dependent threshold (based on cache context)
-        # Stricter threshold if cache already has relevant info
-        write_thresh = self.write_threshold(context_cache)  # [B, T, 1] in [0, 1]
+        # Threshold: fixed or learned
+        if self.use_fixed_threshold:
+            # Fixed threshold - forces gate VALUES to be decisive
+            # Polarization loss will push soft_decision to 0 or 1
+            write_thresh = torch.full_like(soft_decision, self.fixed_threshold)
+        else:
+            # Learned context-dependent threshold (based on cache context)
+            # Stricter threshold if cache already has relevant info
+            write_thresh = self.write_threshold(context_cache)  # [B, T, 1] in [0, 1]
 
         if hard or not self.training:
             write_gate = (soft_decision > write_thresh).float()
@@ -550,8 +569,9 @@ class MemoryController(nn.Module):
         return {
             'updated_cache': updated_cache,
             'write_gate': write_gate,
+            'soft_write_gate': soft_decision,  # For polarization loss (pre-threshold)
             'write_threshold': write_thresh,  # Include threshold tensor for gradient flow
-            'write_decision': soft_decision,  # For debugging/analysis
+            'write_decision': soft_decision,  # For debugging/analysis (alias)
             'importance': importance,
             'slot_probs': slot_probs,
             'num_writes': write_gate.sum(dim=1).squeeze(-1),  # [B]
@@ -672,6 +692,20 @@ class ConfidenceEstimator(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+        
+        # CRITICAL: Initialize halt thresholds to output HIGH values (0.8-0.9)
+        # This encourages exploration (more iterations/passes) early in training.
+        # The sigmoid output layer needs positive bias to start high.
+        # sigmoid(2.0) ≈ 0.88, so bias=2.0 gives ~88% initial threshold
+        with torch.no_grad():
+            # Layer halt threshold - last layer is the sigmoid input
+            for layer in self.layer_halt_threshold:
+                if isinstance(layer, nn.Linear) and layer.out_features == 1:
+                    layer.bias.fill_(2.0)  # sigmoid(2.0) ≈ 0.88
+            # Model halt threshold - same treatment
+            for layer in self.model_halt_threshold:
+                if isinstance(layer, nn.Linear) and layer.out_features == 1:
+                    layer.bias.fill_(2.0)  # sigmoid(2.0) ≈ 0.88
 
     def forward(
         self,

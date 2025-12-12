@@ -519,6 +519,10 @@ def train_epoch(
                 writer.add_scalar('Loss/efficiency', metrics['loss_efficiency'], global_step)
             if 'loss_gate_polar' in metrics:
                 writer.add_scalar('Loss/gate_polar', metrics['loss_gate_polar'], global_step)
+            if 'loss_feedback_polar' in metrics:
+                writer.add_scalar('Loss/feedback_polar', metrics['loss_feedback_polar'], global_step)
+            if 'loss_gate_sparsity' in metrics:
+                writer.add_scalar('Loss/gate_sparsity', metrics['loss_gate_sparsity'], global_step)
             
             # === Deep Supervision Metrics ===
             if 'loss_task_weighted' in metrics:
@@ -786,10 +790,10 @@ def main():
     # Model configuration per preset
     if preset_name == "fast_full":
         d_model, d_cache = 64, 48
-        num_layers, num_slots, num_heads = 4, 16, 2  # Reduced layers and slots
-        batch_size = 1  # Single sample - 30x30 grids are huge!
-        max_passes, max_internal_iterations = 5, 5  # Reduced recursion
-        grad_accum_steps = 2  # Compensate for tiny batch
+        num_layers, num_slots, num_heads = 4, 32, 2  # Reduced layers and slots
+        batch_size = 8  # Single sample - 30x30 grids are huge!
+        max_passes, max_internal_iterations = 3, 3
+        grad_accum_steps = 1  # Compensate for tiny batch
     elif preset_name == "runpod":
         d_model, d_cache = 128, 64
         num_layers, num_slots, num_heads = 4, 16, 4
@@ -840,6 +844,9 @@ def main():
         max_passes=max_passes,
         dropout=0.0,
         confidence_threshold=0.8,
+        use_fixed_gate_threshold=config.use_fixed_gate_threshold,
+        fixed_gate_threshold=config.gate_threshold,
+        use_hippo_init=features.use_hippo_init,
     ).to(device)
     
     print_model_summary(model)
@@ -855,12 +862,12 @@ def main():
     print(f"Using AdamAtan2 optimizer (lr={lr})")
     
     # Gradient accumulation - use preset value if set, otherwise default
-    if preset_name == "fast_full":
-        grad_accum_steps = 8  # Compensate for batch_size=1
-    elif preset_name in ["full", "runpod"]:
-        grad_accum_steps = 2
-    else:
-        grad_accum_steps = 1
+    # if preset_name == "fast_full":
+    #     grad_accum_steps = 8  # Compensate for batch_size=1
+    # elif preset_name in ["full", "runpod"]:
+    #     grad_accum_steps = 2
+    # else:
+    grad_accum_steps = 1
     print(f"Gradient accumulation steps: {grad_accum_steps}, effective batch: {batch_size * grad_accum_steps}")
     
     # Mixed precision training (reduces memory by ~50%)
