@@ -392,7 +392,7 @@ def compute_adaptive_ponder_cost(
 def compute_q_halt_loss(
     aux_info: Dict,
     test_output: torch.Tensor,
-    ignore_label: int = -100,
+    ignore_label: int = -1,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Q-Halt Loss (TRM-inspired) - trains the halt head to predict sequence correctness.
@@ -422,25 +422,18 @@ def compute_q_halt_loss(
     pass_logits = aux_info.get('pass_logits', [])
     
     if not q_halt_logits_list or not pass_logits:
-        return torch.tensor(0.0, device=device), {'q_halt_accuracy': 0.0, 'n_passes_with_q_halt': 0}
+        return torch.tensor(0.0, device=device), {}
     
     # Ensure we have same number of q_halt logits as pass logits
     n_passes = min(len(q_halt_logits_list), len(pass_logits))
-    if n_passes == 0:
-        return torch.tensor(0.0, device=device), {'q_halt_accuracy': 0.0, 'n_passes_with_q_halt': 0}
     
     total_loss = torch.tensor(0.0, device=device)
     total_q_halt_accuracy = 0.0
-    valid_passes = 0
     valid_mask = (test_output != ignore_label)  # [B, S]
     
     for i in range(n_passes):
         q_halt = q_halt_logits_list[i]  # [B] - raw logits
         logits = pass_logits[i]  # [B, S, V]
-        
-        # Skip if inputs contain NaN
-        if torch.isnan(q_halt).any() or torch.isnan(logits).any():
-            continue
         
         # Compute sequence-level correctness at this pass
         predictions = logits.argmax(dim=-1)  # [B, S]
@@ -450,20 +443,20 @@ def compute_q_halt_loss(
         # BCE loss: train q_halt to predict correctness
         # q_halt > 0 should mean "answer is correct" (halt)
         # q_halt < 0 should mean "answer is wrong" (continue)
-        # Use safe normalization: log_sigmoid for numerical stability
-        q_halt_safe = q_halt.clamp(min=-15.0, max=15.0)  # Tighter clamp for stability
+        # Clamp q_halt to prevent extreme logits causing NaN
+        q_halt_clamped = q_halt.clamp(min=-20.0, max=20.0)
         loss = F.binary_cross_entropy_with_logits(
-            q_halt_safe,
+            q_halt_clamped,
             seq_correct,
             reduction='mean'
         )
         
         # Check for NaN and skip if present
         if torch.isnan(loss) or torch.isinf(loss):
+            print(f"Warning: NaN or Inf in Q-halt loss at pass {i}. Skipping this pass.")
             continue
             
         total_loss = total_loss + loss
-        valid_passes += 1
         
         # Track accuracy of halt prediction
         with torch.no_grad():
@@ -471,17 +464,13 @@ def compute_q_halt_loss(
             q_halt_correct = (halt_decision == seq_correct).float().mean().item()
             total_q_halt_accuracy += q_halt_correct
     
-    # Average over valid passes (with epsilon to avoid division by zero)
-    if valid_passes > 0:
-        avg_loss = total_loss / valid_passes
-        avg_accuracy = total_q_halt_accuracy / valid_passes
-    else:
-        avg_loss = torch.tensor(0.0, device=device)
-        avg_accuracy = 0.0
+    # Average over passes
+    avg_loss = total_loss / n_passes
+    avg_accuracy = total_q_halt_accuracy / n_passes
     
     metrics = {
         'q_halt_accuracy': avg_accuracy,
-        'n_passes_with_q_halt': valid_passes,
+        'n_passes_with_q_halt': n_passes,
     }
     
     return avg_loss, metrics
@@ -514,57 +503,48 @@ def compute_model_info_gain_loss(
     """
     pass_info_gains = aux_info.get('pass_info_gains', [])
     
-    # Guard: return early if empty or None
-    if not pass_info_gains or len(pass_info_gains) == 0:
-        return torch.tensor(0.0), {'avg_model_info_gain': 0.0, 'num_passes_with_info_gain': 0}
+    if not pass_info_gains:
+        return torch.tensor(0.0), {'avg_model_info_gain': 0.0}
     
-    # Get device from first valid info gain tensor
+    # Get device from first info gain if it's a tensor
     device = 'cpu'
     for ig in pass_info_gains:
-        if isinstance(ig, torch.Tensor) and ig.numel() > 0:
+        if isinstance(ig, torch.Tensor):
             device = ig.device
             break
     
     total_loss = torch.tensor(0.0, device=device)
     total_info_gain = 0.0
-    valid_count = 0
-    weight_sum = 0.0
     
     for i, info_gain in enumerate(pass_info_gains):
         # Convert to tensor if needed
         if not isinstance(info_gain, torch.Tensor):
-            ig_tensor = torch.tensor(float(info_gain), device=device)
+            ig_tensor = torch.tensor(info_gain, device=device)
         else:
             ig_tensor = info_gain
         
-        # Skip NaN/Inf values
-        if torch.isnan(ig_tensor).any() or torch.isinf(ig_tensor).any():
-            continue
-        
         # Weight: earlier passes should contribute more
         weight = decay ** i  # 1.0, 0.7, 0.49, ...
-        weight_sum += weight
         
         if maximize:
             # Maximize info gain: loss = -info_gain
-            # Use abs() to encourage large entropy changes in either direction
             total_loss = total_loss - weight * ig_tensor.abs()
+        else:
+            # Just track, no loss
+            pass
         
         # Detach for logging to avoid warning about .item() on gradient tensor
-        ig_val = ig_tensor.detach().abs().item() if isinstance(ig_tensor, torch.Tensor) else abs(info_gain)
-        total_info_gain += ig_val
-        valid_count += 1
+        total_info_gain += ig_tensor.detach().abs().item() if isinstance(ig_tensor, torch.Tensor) else abs(info_gain)
     
-    # Normalize by weighted sum (not just count) for proper decay normalization
-    if valid_count > 0 and weight_sum > 1e-8:
-        total_loss = total_loss / weight_sum
-        avg_info_gain = total_info_gain / valid_count
-    else:
-        avg_info_gain = 0.0
+    avg_info_gain = total_info_gain / len(pass_info_gains)
+    
+    # Normalize by number of passes
+    if len(pass_info_gains) > 0:
+        total_loss = total_loss / len(pass_info_gains)
     
     metrics = {
         'avg_model_info_gain': avg_info_gain,
-        'num_passes_with_info_gain': valid_count,
+        'num_passes_with_info_gain': len(pass_info_gains),
     }
     
     return total_loss, metrics
@@ -781,8 +761,7 @@ def compute_layer_divergence_loss(
     """
     device = None
     total_loss = torch.tensor(0.0)
-    weight_sum_stability = 0.0
-    weight_sum_info = 0.0
+    num_terms = 0
     
     # === Part 1: Cosine Divergence (stability-based) ===
     layer_stabilities = aux_info.get('layer_stabilities', [])
@@ -797,22 +776,17 @@ def compute_layer_divergence_loss(
             device = stability.device
             total_loss = total_loss.to(device)
         
-        # Skip NaN/Inf
-        if isinstance(stability, torch.Tensor) and (torch.isnan(stability).any() or torch.isinf(stability).any()):
-            continue
-        
         # Divergence = 1 - stability (cosine distance)
         if isinstance(stability, torch.Tensor):
-            divergence = 1.0 - stability.clamp(0, 1)  # Ensure stability is in [0,1]
+            divergence = 1.0 - stability
         else:
-            divergence = torch.tensor(max(0.0, 1.0 - float(stability)), device=device)
+            divergence = torch.tensor(1.0 - stability, device=device)
         
-        # Decaying requirement with weight
-        weight = divergence_decay ** i  # 1.0, 0.5, 0.25, ...
-        required_divergence = min_divergence * weight
+        # Decaying requirement
+        required_divergence = min_divergence * (divergence_decay ** i)
         deficit = F.relu(required_divergence - divergence)
-        total_loss = total_loss + weight * (deficit ** 2).mean()
-        weight_sum_stability += weight
+        total_loss = total_loss + (deficit ** 2).mean()
+        num_terms += 1
     
     # === Part 2: Information Gain ===
     layer_info_gains = aux_info.get('layer_info_gains', [])
@@ -825,34 +799,27 @@ def compute_layer_divergence_loss(
             device = info_gain.device
             total_loss = total_loss.to(device)
         
-        # Skip NaN/Inf
-        if isinstance(info_gain, torch.Tensor) and (torch.isnan(info_gain).any() or torch.isinf(info_gain).any()):
-            continue
-        
         if isinstance(info_gain, torch.Tensor):
-            abs_info_gain = info_gain.abs().clamp(max=10.0)  # Clamp to prevent explosion
+            abs_info_gain = info_gain.abs()
         else:
-            abs_info_gain = torch.tensor(min(abs(float(info_gain)), 10.0), device=device)
-        
-        # Weight: earlier iterations should contribute more
-        weight = divergence_decay ** i  # 1.0, 0.5, 0.25, ...
+            abs_info_gain = torch.tensor(abs(info_gain), device=device)
         
         if maximize_info_gain:
             # Maximize info gain: loss = -|info_gain|
+            # Weight earlier iterations more (they should do more work)
+            weight = divergence_decay ** i  # 1.0, 0.5, 0.25, ...
             total_loss = total_loss - weight * abs_info_gain.mean()
         else:
             # Old behavior: penalize below threshold
             min_info_gain = 0.01
-            required_info_gain = min_info_gain * weight
+            required_info_gain = min_info_gain * (divergence_decay ** i)
             info_deficit = F.relu(required_info_gain - abs_info_gain)
-            total_loss = total_loss + weight * (info_deficit ** 2).mean()
+            total_loss = total_loss + (info_deficit ** 2).mean()
         
-        weight_sum_info += weight
+        num_terms += 1
     
-    # Normalize by total weight sum (not count) for proper weighting
-    total_weight = weight_sum_stability + weight_sum_info
-    if total_weight > 1e-8:
-        total_loss = total_loss / total_weight
+    if num_terms > 0:
+        total_loss = total_loss / num_terms
     
     return total_loss
 
@@ -1024,21 +991,7 @@ def compute_task_loss(
             'task_ce': 10.0, 'task_l1': 1.0
         }
     
-    # Filter out any None or NaN logits from pass_logits_list
-    valid_logits_list = []
-    if pass_logits_list:
-        for p_logits in pass_logits_list:
-            if p_logits is not None and not torch.isnan(p_logits).any():
-                valid_logits_list.append(p_logits)
-    
-    logits_to_process = valid_logits_list if valid_logits_list else [logits]
-    n_passes = len(logits_to_process)
-    
-    if n_passes == 0:
-        return torch.tensor(10.0, device=device, requires_grad=True), {
-            'task_ce': 10.0, 'task_l1': 1.0
-        }
-    
+    logits_to_process = pass_logits_list if pass_logits_list else [logits]
     class_weights = compute_class_weights(test_output, vocab_size, IGNORE_LABEL)
     
     ce_loss = torch.tensor(0.0, device=device)
@@ -1046,8 +999,6 @@ def compute_task_loss(
     
     for p_logits in logits_to_process:
         # === 1. Standard Cross-Entropy ===
-        # Use log_softmax for numerical stability instead of raw logits
-        log_probs = F.log_softmax(p_logits, dim=-1)  # [B, S, V]
         logits_flat = p_logits.reshape(-1, vocab_size)
         targets_flat = test_output.reshape(-1)
         
@@ -1060,7 +1011,7 @@ def compute_task_loss(
         
         # === 2. Smooth L1: ||softmax(logits) - one_hot(target)|| ===
         valid_mask = (test_output != IGNORE_LABEL)  # [B, S]
-        probs = torch.exp(log_probs)  # Use exp(log_softmax) for numerical stability
+        probs = F.softmax(p_logits, dim=-1)  # [B, S, V]
         
         # One-hot targets (clamp to handle -100)
         targets_clamped = test_output.clamp(min=0)  # [B, S]
@@ -1074,9 +1025,8 @@ def compute_task_loss(
         num_valid = valid_mask.sum().clamp(min=1)
         l1_loss = l1_loss + l1_per_pos.sum() / num_valid
 
-    # Normalize by number of passes
-    ce_loss = ce_loss / n_passes
-    l1_loss = l1_loss / n_passes
+    ce_loss = ce_loss / len(logits_to_process)
+    l1_loss = l1_loss / len(logits_to_process)
     
     # Combine: CE for classification + Smooth L1 for consistent gradient
     total_loss = ce_loss + l1_weight * l1_loss

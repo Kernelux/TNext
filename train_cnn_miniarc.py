@@ -1,43 +1,30 @@
 """
-Training Script for Mini-ARC
-============================
+Training Script for CNN + Cache Model on Mini-ARC
+=================================================
 
-Mini-ARC version of train_recursive.py for fast iteration.
+This trains a 1D CNN model augmented with the DLSMN cache system.
+The goal is to show that cache can give CNNs transformer-like
+global reasoning capabilities.
 
-Key differences from full ARC:
-- 5x5 grids instead of 30x30 → 36x faster per sample
-- Smaller model recommended (less data, simpler tasks)
-- Faster epochs, quicker feedback loop
+Key differences from transformer-based train_miniarc.py:
+- Uses 1D convolutions instead of self-attention for local processing
+- Cache provides global context (instead of O(N²) attention)
+- Potentially faster and more parameter-efficient
 
 Usage:
-    python train_miniarc.py [preset]
+    python train_cnn_miniarc.py [preset]
     
 Presets:
-    debug       - Minimal config for debugging
-    fast        - Quick training for iteration
-    fast_full   - Same as train_recursive.py fast_full
-    full        - Full model for best performance
-    trm         - TRM-style: more passes, single layer iteration
-    trm_minimal - TRM-style with fewer passes (faster)
-    trm_deep    - More layers with TRM-style refinement
-
-Halting Strategy (TRM-inspired Q-halt):
-- Q-halt head predicts: "Is the current answer correct?"
-- Trained with BCE against actual sequence correctness
-- Halt when: q_halt > 0 (model believes answer is correct)
-- Also tracks entropy/info_gain for analysis
-
-This is smarter than entropy-only halting because:
-- High confidence ≠ correct answer (model can be confidently wrong)
-- Direct supervision: correctness is what we actually care about
-- Model learns to recognize "what does a wrong answer look like?"
+    debug   - Minimal for testing
+    fast    - Quick training iteration
+    full    - Best performance
+    compare - Same params as transformer for fair comparison
 """
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from contextlib import nullcontext
 from tqdm import tqdm
 import os
 import time
@@ -45,17 +32,16 @@ import numpy as np
 from pathlib import Path
 from typing import Tuple, Optional, Dict
 
-# Import modular components
+# Import components
 from components import (
     FeatureFlags,
     TrainingConfig,
     FEATURE_PRESETS,
-    RecursiveRefinementModel,
     EMA,
-    compute_total_loss,
     AdamAtan2,
 )
-from components.logging import MetricsLogger, create_logger
+from components.cnn_cache_model import CNNCacheModel, create_cnn_cache_model
+from components.logging import MetricsLogger
 from components.miniarc_dataset import (
     MiniARCDataset,
     VOCAB_SIZE, MAX_SEQ_LEN, PAD_TOKEN, COLOR_OFFSET, MAX_GRID_SIZE,
@@ -64,7 +50,7 @@ from components.miniarc_dataset import (
 
 
 # ============================================================================
-# Visualization Utilities
+# Visualization (same as train_miniarc.py)
 # ============================================================================
 
 ARC_COLORS = {
@@ -73,26 +59,15 @@ ARC_COLORS = {
 }
 RESET = '\033[0m'
 
-# RGB palette for TensorBoard images
 ARC_PALETTE = np.array([
-    [0, 0, 0],       # 0: Black
-    [0, 116, 217],   # 1: Blue
-    [255, 65, 54],   # 2: Red
-    [46, 204, 64],   # 3: Green
-    [255, 220, 0],   # 4: Yellow
-    [170, 170, 170], # 5: Grey
-    [240, 18, 190],  # 6: Fuschia
-    [255, 133, 27],  # 7: Orange
-    [127, 219, 255], # 8: Teal
-    [135, 12, 37],   # 9: Maroon
+    [0, 0, 0], [0, 116, 217], [255, 65, 54], [46, 204, 64], [255, 220, 0],
+    [170, 170, 170], [240, 18, 190], [255, 133, 27], [127, 219, 255], [135, 12, 37],
 ], dtype=np.uint8)
 
 
 def grid_to_ascii(grid, max_width: int = 10, max_height: int = 10) -> list:
-    """Convert grid to colored ASCII art."""
     if isinstance(grid, torch.Tensor):
         grid = grid.cpu().numpy()
-    
     h, w = min(grid.shape[0], max_height), min(grid.shape[1], max_width)
     lines = []
     for row in range(h):
@@ -106,19 +81,15 @@ def grid_to_ascii(grid, max_width: int = 10, max_height: int = 10) -> list:
 
 
 def prediction_to_grid(prediction: np.ndarray, target: np.ndarray) -> np.ndarray:
-    """Convert prediction to grid using target's valid region."""
     pred_2d = prediction.reshape(MAX_GRID_SIZE, MAX_GRID_SIZE)
     target_2d = target.reshape(MAX_GRID_SIZE, MAX_GRID_SIZE)
-    
     grid = np.zeros_like(pred_2d, dtype=np.uint8)
     valid_mask = (target_2d != -100) & (pred_2d >= COLOR_OFFSET)
     grid[valid_mask] = np.clip(pred_2d[valid_mask] - COLOR_OFFSET, 0, 9)
-    
     return grid
 
 
 def grid_to_rgb(grid: np.ndarray, cell_size: int = 10) -> np.ndarray:
-    """Convert grid to RGB image for TensorBoard."""
     if isinstance(grid, torch.Tensor):
         grid = grid.cpu().numpy()
     grid = np.clip(grid, 0, 9).astype(np.int32)
@@ -126,76 +97,6 @@ def grid_to_rgb(grid: np.ndarray, cell_size: int = 10) -> np.ndarray:
     if cell_size > 1:
         rgb = np.repeat(np.repeat(rgb, cell_size, axis=0), cell_size, axis=1)
     return rgb
-
-
-def create_sample_image(
-    demo_inputs: torch.Tensor,
-    demo_outputs: torch.Tensor,
-    test_input: torch.Tensor,
-    test_output: torch.Tensor,
-    prediction: torch.Tensor,
-    max_demos: int = 2,
-    cell_size: int = 16,  # Larger cells for Mini-ARC's 5x5 grids
-) -> np.ndarray:
-    """Create combined image for TensorBoard visualization."""
-    num_demos = min(demo_inputs.shape[0], max_demos)
-    
-    # Convert to grids
-    demo_in_grids = [sequence_to_grid(demo_inputs[d].cpu().numpy()) for d in range(num_demos)]
-    demo_out_grids = [sequence_to_grid(demo_outputs[d].cpu().numpy()) for d in range(num_demos)]
-    test_in_grid = sequence_to_grid(test_input.cpu().numpy())
-    target_grid = target_to_grid(test_output.cpu().numpy())
-    pred_grid = prediction_to_grid(prediction.cpu().numpy(), test_output.cpu().numpy())
-    
-    # Pad all grids to same size
-    all_grids = demo_in_grids + demo_out_grids + [test_in_grid, target_grid, pred_grid]
-    max_h = max(g.shape[0] for g in all_grids)
-    max_w = max(g.shape[1] for g in all_grids)
-    
-    def pad_grid(g, h, w):
-        padded = np.zeros((h, w), dtype=g.dtype)
-        padded[:g.shape[0], :g.shape[1]] = g
-        return padded
-    
-    demo_in_grids = [pad_grid(g, max_h, max_w) for g in demo_in_grids]
-    demo_out_grids = [pad_grid(g, max_h, max_w) for g in demo_out_grids]
-    test_in_grid = pad_grid(test_in_grid, max_h, max_w)
-    target_grid = pad_grid(target_grid, max_h, max_w)
-    pred_grid = pad_grid(pred_grid, max_h, max_w)
-    
-    # Convert to RGB
-    demo_in_imgs = [grid_to_rgb(g, cell_size) for g in demo_in_grids]
-    demo_out_imgs = [grid_to_rgb(g, cell_size) for g in demo_out_grids]
-    test_in_img = grid_to_rgb(test_in_grid, cell_size)
-    target_img = grid_to_rgb(target_grid, cell_size)
-    pred_img = grid_to_rgb(pred_grid, cell_size)
-    
-    # Create separators
-    sep_h, sep_w = 4, max_w * cell_size
-    h_sep = np.ones((sep_h, sep_w * 2 + sep_h, 3), dtype=np.uint8) * 128
-    v_sep = np.ones((max_h * cell_size, sep_h, 3), dtype=np.uint8) * 128
-    
-    # Build rows: Demo pairs
-    rows = []
-    for i in range(num_demos):
-        row = np.concatenate([demo_in_imgs[i], v_sep, demo_out_imgs[i]], axis=1)
-        rows.append(row)
-        rows.append(h_sep[:, :row.shape[1], :])
-    
-    # Test row: Input | Target | Prediction
-    v_sep_small = np.ones((max_h * cell_size, sep_h, 3), dtype=np.uint8) * 128
-    test_row = np.concatenate([test_in_img, v_sep_small, target_img, v_sep_small, pred_img], axis=1)
-    
-    # Normalize widths
-    max_row_width = max(r.shape[1] for r in rows + [test_row])
-    final_rows = []
-    for r in rows + [test_row]:
-        if r.shape[1] < max_row_width:
-            pad = np.zeros((r.shape[0], max_row_width - r.shape[1], 3), dtype=np.uint8)
-            r = np.concatenate([r, pad], axis=1)
-        final_rows.append(r)
-    
-    return np.concatenate(final_rows, axis=0)
 
 
 def visualize_sample(
@@ -208,27 +109,28 @@ def visualize_sample(
     step: int = 0,
     aux: Optional[Dict] = None,
 ) -> str:
-    """Visualize a sample with metrics."""
     lines = []
     lines.append(f"\n{'='*60}")
-    lines.append(f"[Step {step}] Mini-ARC Sample #{sample_idx}")
+    lines.append(f"[Step {step}] CNN+Cache Mini-ARC Sample #{sample_idx}")
     
-    # Recursive refinement stats
     if aux:
-        passes = aux.get('passes_run', 1)
-        max_passes = aux.get('max_passes', passes)
-        layer_iters = aux.get('layer_iterations', [])
-        avg_iters = sum(layer_iters) / len(layer_iters) if layer_iters else 1
-        lines.append(f"  Passes: {passes}/{max_passes} | Avg Layer Iters: {avg_iters:.1f}")
+        M = aux.get('passes_run', 1)
+        K = aux.get('layer_iters', 1)
+        lines.append(f"  Passes (M): {M} | Layer Iters (K): {K}")
         
-        pass_confs = aux.get('pass_confidences', [])
-        if pass_confs:
-            conf_str = ", ".join([f"{c.mean():.3f}" for c in pass_confs])
-            lines.append(f"  Confidences: [{conf_str}]")
+        read_gates = aux.get('read_gates', [])
+        write_gates = aux.get('write_gates', [])
+        if read_gates:
+            # Gates are tensors, convert to scalar for display
+            avg_read = sum(g.mean().item() for g in read_gates) / len(read_gates)
+            lines.append(f"  Avg Read Gate: {avg_read:.3f}")
+        if write_gates:
+            avg_write = sum(g.mean().item() for g in write_gates) / len(write_gates)
+            lines.append(f"  Avg Write Gate: {avg_write:.3f}")
     
     lines.append(f"{'='*60}")
     
-    # Demo pairs (show max 2)
+    # Demo pairs
     num_demos = demo_inputs.shape[0]
     for d in range(min(num_demos, 2)):
         demo_in_grid = sequence_to_grid(demo_inputs[d].cpu().numpy())
@@ -277,11 +179,13 @@ def visualize_sample(
 
 
 # ============================================================================
-# Loss Computation
+# Loss Computation (Simple version for CNN + Cache)
 # ============================================================================
 
-def compute_miniarc_loss(
-    model: RecursiveRefinementModel,
+IGNORE_LABEL = -100
+
+def compute_cnn_loss(
+    model: CNNCacheModel,
     logits: torch.Tensor,
     targets: torch.Tensor,
     aux: Dict,
@@ -289,20 +193,79 @@ def compute_miniarc_loss(
     step: int,
     device: torch.device,
 ) -> Tuple[torch.Tensor, Dict]:
-    """Compute loss for Mini-ARC (same as full ARC)."""
-    total_loss, metrics = compute_total_loss(
-        model=model,
-        logits=logits,
-        test_output=targets,
-        aux_info=aux,
-        config=config,
-        global_step=step,
-        device=device,
-    )
+    """
+    Simple loss for CNN + Cache model.
     
-    # Add halting info
-    metrics['halted_early'] = aux.get('halted_early', False)
-    metrics['passes_run'] = aux.get('passes_run', 1)
+    Components:
+    1. Task loss: Cross-entropy with deep supervision (train on all passes)
+    2. Gate usage loss: Encourage gates to be > 0 (prevent dead cache)
+    
+    This is intentionally simpler than the transformer loss to show
+    the cache mechanism works without complex halting machinery.
+    """
+    # === 1. TASK LOSS with deep supervision ===
+    pass_logits = aux.get('pass_logits', [])
+    if not pass_logits:
+        pass_logits = [logits.detach()]
+    
+    # Weight later passes more (they should be better)
+    num_passes = len(pass_logits)
+    pass_weights = [0.5 ** (num_passes - 1 - i) for i in range(num_passes)]
+    total_weight = sum(pass_weights)
+    pass_weights = [w / total_weight for w in pass_weights]
+    
+    task_loss = torch.tensor(0.0, device=device)
+    
+    for pass_idx, p_logits in enumerate(pass_logits):
+        # Ensure we use the version with gradients for the final pass
+        if pass_idx == len(pass_logits) - 1:
+            p_logits = logits  # Use original logits with gradients
+        
+        # Flatten for cross entropy
+        B, S, V = p_logits.shape
+        flat_logits = p_logits.reshape(-1, V)
+        flat_targets = targets.reshape(-1)
+        
+        # Cross entropy (ignores -100)
+        ce = F.cross_entropy(flat_logits, flat_targets, ignore_index=IGNORE_LABEL)
+        task_loss = task_loss + pass_weights[pass_idx] * ce
+    
+    # === 2. GATE USAGE LOSS ===
+    # Encourage gates to be used (prevent all-zero gates)
+    # This helps the cache actually store and retrieve information
+    gate_loss = torch.tensor(0.0, device=device)
+    avg_read = torch.tensor(0.0, device=device)
+    avg_write = torch.tensor(0.0, device=device)
+    
+    read_gates = aux.get('read_gates', [])
+    write_gates = aux.get('write_gates', [])
+    
+    if read_gates:
+        # Average gate activation across all passes
+        avg_read = torch.stack([g.mean() for g in read_gates]).mean()
+        avg_write = torch.stack([g.mean() for g in write_gates]).mean() if write_gates else torch.tensor(0.0, device=device)
+        
+        # Encourage gates to be around 0.3-0.5 (not too sparse, not too dense)
+        # Loss = 0 when gate ≈ 0.4, increases as it moves away
+        target_gate = 0.4
+        read_gate_loss = (avg_read - target_gate).abs()
+        write_gate_loss = (avg_write - target_gate).abs()
+        
+        gate_loss = 0.1 * (read_gate_loss + write_gate_loss)
+    
+    # === 3. TOTAL LOSS ===
+    total_loss = task_loss + gate_loss
+    
+    # Metrics
+    metrics = {
+        'loss_total': total_loss.detach().item(),
+        'loss_task': task_loss.detach().item(),
+        'loss_gate': gate_loss.detach().item() if isinstance(gate_loss, torch.Tensor) else gate_loss,
+        'avg_read_gate': avg_read.item() if read_gates else 0.0,
+        'avg_write_gate': avg_write.item() if (read_gates and write_gates) else 0.0,
+        'passes_run': aux.get('passes_run', 1),
+        'layer_iters': aux.get('layer_iters', 1),
+    }
     
     return total_loss, metrics
 
@@ -312,7 +275,7 @@ def compute_miniarc_loss(
 # ============================================================================
 
 def train_epoch(
-    model: RecursiveRefinementModel,
+    model: CNNCacheModel,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -320,7 +283,8 @@ def train_epoch(
     global_step: int = 0,
     logger: Optional[MetricsLogger] = None,
     log_interval: int = 10,
-    force_max_passes: bool = False,  # Warmup mode
+    max_passes: Optional[int] = None,
+    max_layer_iters: Optional[int] = None,
 ) -> Tuple[float, float, float, int]:
     """Training epoch."""
     model.train()
@@ -343,28 +307,27 @@ def train_epoch(
         
         optimizer.zero_grad()
         
-        # Forward pass (with optional warmup mode)
+        # Forward (simple: fixed M passes, K layer iters)
         logits, cache, aux = model(
             demo_inputs, demo_outputs, test_input,
             config=config,
             step=global_step,
             return_aux=True,
-            force_max_passes=force_max_passes,  # Warmup: disable early halting
+            max_passes=max_passes,
+            max_layer_iters=max_layer_iters,
         )
         
-        # Compute loss
-        loss, metrics = compute_miniarc_loss(
+        # Loss
+        loss, metrics = compute_cnn_loss(
             model, logits, test_output,
             aux, config, global_step, device
         )
         
         # Backward
         loss.backward()
-        
-        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         
-        # Check for NaN gradients
+        # Check for NaN
         has_nan = any(
             p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any())
             for p in model.parameters()
@@ -393,7 +356,7 @@ def train_epoch(
         cell_acc = correct_cells / max(total_cells, 1)
         task_acc = correct_tasks / max(total_tasks, 1)
         
-        # TensorBoard logging (using MetricsLogger)
+        # Logging
         if logger is not None and batch_idx % log_interval == 0:
             logger.log_step(
                 step=global_step,
@@ -404,8 +367,8 @@ def train_epoch(
                 task_acc=task_acc,
             )
         
-        # Visualization and Image Logging
-        if logger is not None and global_step % 50 == 0:
+        # Visualization
+        if global_step % 50 == 0:
             viz_str = visualize_sample(
                 demo_inputs=demo_inputs[0],
                 demo_outputs=demo_outputs[0],
@@ -417,28 +380,15 @@ def train_epoch(
                 aux=aux,
             )
             print(viz_str)
-            
-            # TensorBoard image logging
-            try:
-                sample_img = create_sample_image(
-                    demo_inputs=demo_inputs[0],
-                    demo_outputs=demo_outputs[0],
-                    test_input=test_input[0],
-                    test_output=test_output[0],
-                    prediction=preds[0],
-                )
-                sample_img_chw = np.transpose(sample_img, (2, 0, 1)).astype(np.float32) / 255.0
-                logger.log_image('Samples/prediction', sample_img_chw, global_step)
-            except Exception as e:
-                print(f"[Warning] Image logging failed: {e}")
         
         # Progress bar
-        passes = aux.get('passes_run', 1)
+        M = aux.get('passes_run', 1)
+        K = aux.get('layer_iters', 1)
         pbar.set_postfix({
             'loss': f'{loss_val:.3f}',
             'cell': f'{cell_acc:.3f}',
             'task': f'{task_acc:.3f}',
-            'P': f'{passes}',
+            'M': M, 'K': K,
         })
         
         # Cleanup
@@ -459,14 +409,14 @@ def train_epoch(
 
 @torch.no_grad()
 def evaluate(
-    model: RecursiveRefinementModel,
+    model: CNNCacheModel,
     dataloader: DataLoader,
     device: torch.device,
     config: TrainingConfig,
     global_step: int = 0,
     visualize_samples: int = 3,
 ) -> Tuple[float, float]:
-    """Evaluation loop."""
+    """Evaluation."""
     model.eval()
     correct_tasks = 0
     total_tasks = 0
@@ -482,7 +432,6 @@ def evaluate(
         tau_min=0.1,
         tau_start=0.1,
         max_passes=config.max_passes,
-        max_recurrent_steps=config.max_recurrent_steps,
         features=config.features,
     )
     
@@ -539,16 +488,24 @@ def evaluate(
 
 def print_model_summary(model: torch.nn.Module):
     """Print model parameter summary."""
-    print("\n" + "="*50)
+    print("\n" + "="*60)
     print(f"Model: {model.__class__.__name__}")
-    print("="*50)
+    print("="*60)
     
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
+    # Count by component
+    embed_params = sum(p.numel() for n, p in model.named_parameters() if 'embed' in n)
+    conv_params = sum(p.numel() for n, p in model.named_parameters() if 'conv' in n)
+    memory_params = sum(p.numel() for n, p in model.named_parameters() if 'memory' in n)
+    
     print(f"Total Parameters:     {total_params:,}")
     print(f"Trainable Parameters: {trainable_params:,}")
-    print("="*50 + "\n")
+    print(f"  - Embeddings:       {embed_params:,}")
+    print(f"  - Convolutions:     {conv_params:,}")
+    print(f"  - Memory/Cache:     {memory_params:,}")
+    print("="*60 + "\n")
 
 
 # ============================================================================
@@ -558,7 +515,7 @@ def print_model_summary(model: torch.nn.Module):
 def main():
     import sys
     
-    # Download Mini-ARC if needed
+    # Download Mini-ARC
     data_path = download_miniarc("./Mini-ARC")
     
     # Device
@@ -575,11 +532,11 @@ def main():
     print(f"Features: {features.describe()}")
     
     # Model configuration per preset
-    # Mini-ARC needs smaller models due to simpler tasks and less data
+    # CNN + Cache version - Simple refinement with fixed M passes and K layer iters
     # 
-    # Recursive refinement parameters:
-    #   max_passes: Model-level refinement passes (whole model iterates)
-    #   max_layer_iters: Per-layer ACT pondering (within-layer iterations)
+    # Refinement parameters:
+    #   max_passes (M): Model-level refinement passes
+    #   max_layer_iters (K): Layer-level iterations per pass
     #
     # Default learning rate (can be overridden per-preset)
     lr = 5e-4
@@ -587,67 +544,72 @@ def main():
     if preset_name == "debug":
         # Minimal config for debugging
         d_model, d_cache = 32, 24
-        num_layers, num_slots, num_heads = 2, 8, 2
+        num_layers, num_slots = 2, 8
+        kernel_size, num_conv_layers = 3, 1
         batch_size = 16
-        max_passes = 2
-        max_layer_iters = 2
+        max_passes = 2      # M
+        max_layer_iters = 1 # K
         num_epochs = 10
     elif preset_name == "fast":
         # Quick training for iteration
         d_model, d_cache = 64, 48
-        num_layers, num_slots, num_heads = 3, 16, 2
+        num_layers, num_slots = 3, 16
+        kernel_size, num_conv_layers = 5, 2
         batch_size = 32
-        max_passes = 3
-        max_layer_iters = 3
+        max_passes = 3      # M
+        max_layer_iters = 1 # K
         num_epochs = 50
     elif preset_name == "fast_full":
-        # Same as train_recursive.py fast_full - for comparison
-        d_model, d_cache = 64, 48
-        num_layers, num_slots, num_heads = 4, 32, 2
+        # Full features, moderate compute
+        d_model, d_cache = 64, 32
+        num_layers, num_slots = 8, 120  # (24 slots for each layer)
+        kernel_size, num_conv_layers = 3, 3
         batch_size = 8
-        max_passes = 3
-        max_layer_iters = 3
+        max_passes = 1      # M
+        max_layer_iters = 1 # K
         num_epochs = 100
-    elif preset_name == "trm":
-        # TRM-inspired: More passes, single layer iteration (pure recursive style)
+    elif preset_name == "deep":
+        # More layer iterations for deeper refinement
         d_model, d_cache = 64, 48
-        num_layers, num_slots, num_heads = 4, 32, 2
+        num_layers, num_slots = 4, 32
+        kernel_size, num_conv_layers = 5, 2
         batch_size = 16
-        max_passes = 4
-        max_layer_iters = 1  # No per-layer pondering (TRM style)
-        num_epochs = 100
-        lr = 3e-4
-    elif preset_name == "trm_minimal":
-        # Minimal TRM-style for faster iteration
-        d_model, d_cache = 64, 48
-        num_layers, num_slots, num_heads = 4, 32, 2
-        batch_size = 16
-        max_passes = 2
-        max_layer_iters = 1
-        num_epochs = 50
-        lr = 3e-4
-    elif preset_name == "trm_deep":
-        # More layers with TRM-style refinement
-        d_model, d_cache = 64, 48
-        num_layers, num_slots, num_heads = 6, 32, 2  # More layers
-        batch_size = 16
-        max_passes = 3
-        max_layer_iters = 1
+        max_passes = 2      # M - fewer passes
+        max_layer_iters = 4 # K - more layer iters
         num_epochs = 100
         lr = 3e-4
+    elif preset_name == "wide":
+        # More passes, fewer layer iterations
+        d_model, d_cache = 64, 48
+        num_layers, num_slots = 4, 32
+        kernel_size, num_conv_layers = 5, 2
+        batch_size = 16
+        max_passes = 6      # M - more passes
+        max_layer_iters = 1 # K - single layer iter
+        num_epochs = 100
+        lr = 3e-4
+    elif preset_name == "compare":
+        # Direct comparison with transformer - matched params
+        d_model, d_cache = 64, 48
+        num_layers, num_slots = 4, 32
+        kernel_size, num_conv_layers = 5, 2
+        batch_size = 8
+        max_passes = 3      # M
+        max_layer_iters = 1 # K
+        num_epochs = 100
     else:  # full
         # Full model for best performance
         d_model, d_cache = 128, 64
-        num_layers, num_slots, num_heads = 4, 32, 4
+        num_layers, num_slots = 4, 32
+        kernel_size, num_conv_layers = 5, 3
         batch_size = 16
-        max_passes = 4
-        max_layer_iters = 4
+        max_passes = 4      # M
+        max_layer_iters = 2 # K
         num_epochs = 100
     
     # Dataset
     dataset = MiniARCDataset(str(data_path), augment=True)
     
-    # Train/eval split (80/20)
     train_size = int(0.8 * len(dataset))
     eval_size = len(dataset) - train_size
     train_dataset, eval_dataset = torch.utils.data.random_split(
@@ -659,39 +621,36 @@ def main():
     eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
     
     print(f"\nTrain samples: {len(train_dataset)}, Eval samples: {len(eval_dataset)}")
-    print(f"Sequence length: {MAX_SEQ_LEN} tokens (vs 900 for ARC-AGI-2)")
-    print(f"Speedup: ~{900 // MAX_SEQ_LEN}x faster per sample")
-    print(f"Refinement: max_passes={max_passes}, max_layer_iters={max_layer_iters}")
+    print(f"CNN config: kernel={kernel_size}, conv_layers={num_conv_layers}")
+    print(f"Cache config: {num_layers} layers × {num_slots} slots")
+    print(f"Refinement: M={max_passes} model passes, K={max_layer_iters} layer iters")
     
-    # Training config
+    # Config
     config = TrainingConfig(
         tau_start=1.0,
         tau_min=0.1,
         max_passes=max_passes,
-        max_recurrent_steps=max_layer_iters,
         features=features,
-        lambda_step_efficiency=0.02,
-        lambda_diversity=0.01,
     )
     
     # Model
-    model = RecursiveRefinementModel(
+    model = CNNCacheModel(
         vocab_size=VOCAB_SIZE,
         d_model=d_model,
         d_cache=d_cache,
         num_layers=num_layers,
         num_slots=num_slots,
-        num_heads=num_heads,
+        kernel_size=kernel_size,
+        num_conv_layers_per_block=num_conv_layers,
         max_seq_len=MAX_SEQ_LEN,
         max_passes=max_passes,
-        max_internal_iterations=max_layer_iters,
+        max_layer_iters=max_layer_iters,
         dropout=0.0,
-        confidence_threshold=0.8,
     ).to(device)
     
     print_model_summary(model)
     
-    # Optimizer (lr is set per-preset above)
+    # Optimizer
     optimizer = AdamAtan2(
         model.parameters(),
         lr=lr,
@@ -700,26 +659,21 @@ def main():
     print(f"Using AdamAtan2 optimizer (lr={lr})")
     
     # Logging
-    log_dir = Path("logs") / f"miniarc_{preset_name}_{time.strftime('%Y%m%d_%H%M%S')}"
+    log_dir = Path("logs") / f"cnn_cache_{preset_name}_{time.strftime('%Y%m%d_%H%M%S')}"
     writer = SummaryWriter(log_dir)
     logger = MetricsLogger(writer)
     print(f"TensorBoard logs: {log_dir}")
     
-    # Training loop
+    # Training
     best_task_acc = 0
     global_step = 0
-    warmup_epochs = getattr(config, 'warmup_epochs', 1)  # Default 1 warmup epoch
     
     for epoch in range(num_epochs):
-        # Warmup mode: force max passes to stabilize Q-halt learning
-        is_warmup = epoch < warmup_epochs
-        if is_warmup:
-            print(f"[Warmup Epoch {epoch+1}/{warmup_epochs}] Forcing max passes (no early halt)")
-        
         train_loss, train_cell_acc, train_task_acc, global_step = train_epoch(
             model, train_loader, optimizer, device, config, global_step,
             logger=logger, log_interval=10,
-            force_max_passes=is_warmup,  # Warmup: disable early halting
+            max_passes=max_passes,
+            max_layer_iters=max_layer_iters,
         )
         
         logger.log_epoch(epoch, train_loss, train_cell_acc, train_task_acc)
@@ -731,9 +685,11 @@ def main():
                 global_step=global_step, visualize_samples=2,
             )
             
-            if eval_task_acc > best_task_acc:
-                best_task_acc = eval_task_acc
+            # Save if improved (use >= for first save when both are 0)
+            if eval_task_acc > best_task_acc or (eval_task_acc == 0 and best_task_acc == 0 and epoch == 4):
+                best_task_acc = max(eval_task_acc, best_task_acc)
                 torch.save(model.state_dict(), log_dir / "best_model.pt")
+                print(f"  → Saved best model (task_acc={eval_task_acc:.3f})")
             
             logger.log_epoch(epoch, train_loss, train_cell_acc, train_task_acc,
                              eval_cell_acc=eval_cell_acc, eval_task_acc=eval_task_acc)
@@ -742,8 +698,15 @@ def main():
         else:
             print(f"Epoch {epoch+1:3d} | Loss: {train_loss:.4f} | Train Task: {train_task_acc:.3f}")
     
+    # Always save final model
+    torch.save(model.state_dict(), log_dir / "final_model.pt")
+    print(f"  → Saved final model")
+    
     logger.close()
-    print(f"\nTraining complete. Best task accuracy: {best_task_acc:.3f}")
+    print(f"\n{'='*60}")
+    print(f"CNN + Cache Training Complete!")
+    print(f"Best task accuracy: {best_task_acc:.3f}")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":

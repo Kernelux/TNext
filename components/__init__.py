@@ -15,4 +15,5 @@ from .memory_controller import (
 )
 from .unified_layer import UnifiedMemoryLayer, ComputeBlock
 from .recursive_refinement_model import RecursiveRefinementModel
+from .cnn_cache_model import CNNCacheModel, create_cnn_cache_model
 
