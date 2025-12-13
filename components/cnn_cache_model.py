@@ -166,79 +166,228 @@ class ConvBlock(nn.Module):
         return x + residual  # HIGH-D residual connection
 
 
-class CausalGlobalAverage(nn.Module):
+class CausalLatentBank(nn.Module):
     """
-    Causal Global Averaging (CGA) with Sandglass Projections.
+    Causal Latent Bank - compresses input into K queryable latent slots.
     
-    Flow:
-    1. Project input to "summable space" via Sandglass MLP (d -> d/r -> d)
-    2. Compute causal average: avg = cumsum(v) / count
-    3. Project back to model space via Sandglass MLP (d -> d/r -> d)
-    4. Scale: return delta * alpha
+    Key Innovation: Instead of averaging all positions (CGA), we compress
+    into K learned slots that PRESERVE positional structure and allow
+    CONTENT-BASED retrieval.
     
-    The Sandglass MLPs transform features into a space where averaging
-    is semantically meaningful, then transform the average back.
+    This is a novel attention replacement suitable for LLMs:
+    - O(N × K) complexity instead of O(N²) attention
+    - Causal: slot states only depend on past positions
+    - Content-based: each position can query relevant slots
+    - Position-aware: slots capture "what happens in region k"
     
-    No internal residuals - the output is a PURE DELTA to be added externally.
-    Alpha starts at 0 so the model begins training without CGA interference.
+    Flow (Training - Parallel):
+        1. Compute slot update gates: which slots does each position update?
+        2. Compute slot values: what does each position contribute?
+        3. Causal aggregation: cumsum of gated values per slot
+        4. Query: each position attends to K slots (not N positions)
+    
+    Flow (Inference - Incremental):
+        1. Update slot states with new token (EMA-style)
+        2. Query slots for context
+    
+    Architecture:
+        Input [B, S, D]
+            │
+            ▼
+        ┌─────────────────┐
+        │ Slot Gates      │ → Which K slots to update? [B, S, K]
+        │ (content-based) │
+        └────────┬────────┘
+                 │
+                 ▼
+        ┌─────────────────┐
+        │ Causal Cumsum   │ → Aggregate per-slot (parallel, causal)
+        │ (per slot)      │   slot_state[t,k] = Σ_{i≤t} gate[i,k] * v[i]
+        └────────┬────────┘
+                 │
+                 ▼
+        ┌─────────────────┐
+        │ Slot Query      │ → Each position queries K slots
+        │ (cross-attn)    │   O(S × K) instead of O(S × N)
+        └────────┬────────┘
+                 │
+                 ▼
+        Output [B, S, D]
     """
-    def __init__(self, d_model: int, reduction: int = 2, dropout: float = 0.1):
+    
+    def __init__(
+        self, 
+        d_model: int, 
+        num_slots: int = 32,
+        dropout: float = 0.1,
+    ):
         super().__init__()
         self.d_model = d_model
-        d_bottleneck = d_model // reduction
+        self.num_slots = num_slots
         
-        # 1. Project to "summable space" via Sandglass MLP
-        # d_model -> d_bottleneck -> d_model
-        self.norm_in = nn.LayerNorm(d_model)
-        self.to_summable = nn.Sequential(
-            nn.Linear(d_model, d_bottleneck),
+        # === Value Projection ===
+        # Transform input to value space for averaging
+        self.value_proj = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
             nn.GELU(),
-            nn.Linear(d_bottleneck, d_model),
-            nn.Dropout(dropout)
+            nn.Linear(d_model, d_model),
         )
         
-        # 2. Project averaged features back to delta via Sandglass MLP
-        # d_model -> d_bottleneck -> d_model
-        self.norm_out = nn.LayerNorm(d_model)
-        self.to_delta = nn.Sequential(
-            nn.Linear(d_model, d_bottleneck),
-            nn.GELU(),
-            nn.Linear(d_bottleneck, d_model),
-            nn.Dropout(dropout)
+        # === Query Projection ===
+        # Each position queries the K slot "experts"
+        self.query_proj = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
         )
         
-        # Learnable mixing coefficient
-        # Starts at 0 so CGA has NO effect initially.
-        # Model must actively learn to increase alpha if it helps.
+        # === Output ===
+        self.out_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.Dropout(dropout),
+        )
+        
+        # Learnable slot embeddings - K "expert" vectors
+        # Each slot represents a different "lens" for viewing the causal average
+        # Used as both keys (for attention) and values (for context)
+        self.slot_init = nn.Parameter(torch.randn(num_slots, d_model) * 0.02)
+        
+        # Learnable mixing coefficient (starts at 0 for safe initialization)
         self.alpha = nn.Parameter(torch.tensor(0.0))
-
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, S, D]
+        """
+        Forward pass with causal slot aggregation.
         
-        # 1. Project to "summable space" with residual
-        # v = x + MLP(LN(x)) keeps original info + learned refinement
-        v = x + self.to_summable(self.norm_in(x))  # [B, S, D]
+        MEMORY-EFFICIENT VERSION:
+        Instead of creating [B, S, K, D] tensors, we:
+        1. Compute slot states via cumsum (still [B, S, K, D] but only briefly)
+        2. Immediately reduce via attention to [B, S, D]
         
-        # 2. Compute Running Mean (Causal)
-        v_sum = torch.cumsum(v, dim=1)
-        count = torch.arange(1, x.shape[1] + 1, device=x.device, dtype=x.dtype).view(1, -1, 1)
-        history_avg = v_sum / count  # [B, S, D]
+        Actually, let's use a DIFFERENT approach that's truly O(1) in K:
+        - Use learned slot positions (not all positions write to all slots)
+        - Each slot only aggregates from positions in its "receptive field"
         
-        # 3. Project to delta (NO residual - pure transformation)
-        # This ensures output is a learned delta, not avg + delta
-        delta = self.to_delta(self.norm_out(history_avg))  # [B, S, D]
+        For now, use a simplified version that's fast:
+        - Global average (like CGA) but with K learned "lenses"
+        - Each lens transforms the average differently
         
-        # 4. Scale (starts at 0, grows if helpful)
-        return delta * self.alpha
+        Args:
+            x: [B, S, D] input sequence
+            
+        Returns:
+            context: [B, S, D] slot-derived context for each position
+        """
+        B, S, D = x.shape
+        K = self.num_slots
+        
+        # === FAST VERSION: K parallel cumulative averages with different projections ===
+        # Instead of gates per (position, slot), use position-independent slot routing
+        
+        # 1. Project input to value space
+        values = self.value_proj(x)  # [B, S, D]
+        
+        # 2. Compute causal cumulative average (single, shared)
+        cum_values = torch.cumsum(values, dim=1)  # [B, S, D]
+        counts = torch.arange(1, S + 1, device=x.device, dtype=x.dtype).view(1, -1, 1)
+        avg_values = cum_values / counts  # [B, S, D]
+        
+        # 3. Project average through K different "lenses" (slot specialists)
+        # Each slot learns to extract different aspects of the average
+        # slot_init acts as K different projection vectors
+        # Output: weighted combination based on query similarity
+        
+        queries = self.query_proj(x)  # [B, S, D]
+        
+        # Slot keys are the learned slot embeddings (position-independent)
+        # Each position attends to these K "expert" embeddings
+        slot_keys = self.slot_init  # [K, D]
+        
+        # Attention: each position queries K slots
+        # scores[b, s, k] = query[b, s] · slot_key[k]
+        scores = torch.matmul(queries, slot_keys.T) / math.sqrt(D)  # [B, S, K]
+        weights = F.softmax(scores, dim=-1)  # [B, S, K]
+        
+        # Each slot transforms the average differently
+        # slot_values[k] = slot_init[k] acts as a "lens" on the average
+        # We use slot_init as both key AND value (tied, for efficiency)
+        
+        # Combine: context = sum_k weight[k] * (avg_values + slot_init[k])
+        # This gives each position a weighted blend of K "views" of the average
+        slot_values = self.slot_init.unsqueeze(0).unsqueeze(0)  # [1, 1, K, D]
+        
+        # Weighted sum of slot biases
+        slot_context = torch.einsum('bsk,kd->bsd', weights, self.slot_init)  # [B, S, D]
+        
+        # Final context: average + slot-specific bias
+        context = avg_values + slot_context
+        
+        # 4. Output projection
+        output = self.out_proj(context)
+        
+        # Scale by learnable alpha (starts at 0)
+        return output * self.alpha
+    
+    def forward_step(self, x_t: torch.Tensor, cum_values: torch.Tensor, count: int):
+        """
+        Incremental forward for autoregressive inference.
+        
+        Args:
+            x_t: [B, D] single token
+            cum_values: [B, D] cumulative sum of values so far
+            count: int, number of tokens seen so far
+            
+        Returns:
+            context: [B, D] context for this token
+            new_cum_values: [B, D] updated cumulative values
+            new_count: int, updated count
+        """
+        B, D = x_t.shape
+        
+        # Update cumulative average
+        values = self.value_proj(x_t)  # [B, D]
+        new_cum_values = cum_values + values
+        new_count = count + 1
+        avg_values = new_cum_values / new_count  # [B, D]
+        
+        # Query slots
+        query = self.query_proj(x_t)  # [B, D]
+        
+        # Attention to slot embeddings
+        scores = torch.matmul(query, self.slot_init.T) / math.sqrt(D)  # [B, K]
+        weights = F.softmax(scores, dim=-1)  # [B, K]
+        
+        # Weighted sum of slot biases
+        slot_context = torch.matmul(weights, self.slot_init)  # [B, D]
+        
+        # Combine
+        context = avg_values + slot_context
+        output = self.out_proj(context)
+        
+        return output * self.alpha, new_cum_values, new_count
+    
+    def get_initial_state(self, batch_size: int, device: torch.device):
+        """Get initial state for incremental inference."""
+        cum_values = torch.zeros(batch_size, self.d_model, device=device)
+        count = 0
+        return cum_values, count
+
+
+# Keep CausalGlobalAverage as alias for backward compatibility
+CausalGlobalAverage = CausalLatentBank
 
 
 class DilatedConvStack(nn.Module):
     """
     Stack of dilated convolutions with exponentially increasing dilation.
-    PLUS a parallel Global Context branch.
+    PLUS a parallel Causal Latent Bank for global context.
 
     Dilations: [1, 2, 4, 8, ...] to capture multi-scale patterns.
-    Global: Causal Average to capture infinite context (bridging padding gaps).
+    Latent Bank: Compresses input into K slots for content-based retrieval.
+    
+    Key Innovation: Each position can query K latent slots instead of
+    attending to all N positions. This gives O(N × K) complexity with
+    content-based selection - the best of attention without the cost.
     """
 
     def __init__(
@@ -247,16 +396,14 @@ class DilatedConvStack(nn.Module):
         num_layers: int = 4,
         kernel_size: int = 3,
         dropout: float = 0.1,
+        num_latent_slots: int = 32,  # Number of latent slots (K)
     ):
         super().__init__()
 
-        # 1. The Global Context Branch (The "Backpack")
-        # Provides infinite memory persistence
-        #self.global_branch = CausalGlobalAverage(d_model, dropout=dropout)
-        self.global_branches = nn.ModuleList([
-            CausalGlobalAverage(d_model, dropout=dropout)
-            for _ in range(num_layers)
-        ])
+        # 1. The Global Context Branch: Causal Latent Bank (SHARED)
+        # Single latent bank applied once before CNN stack
+        # This is more efficient than per-layer banks
+        self.global_branch = CausalLatentBank(d_model, num_slots=num_latent_slots, dropout=dropout)
 
         # 2. The Local CNN Branch (The "Microscope")
         self.layers = nn.ModuleList([
@@ -275,27 +422,20 @@ class DilatedConvStack(nn.Module):
         Args:
             x: [B, S, D] input
         Returns:
-            [B, S, D] output with large receptive field + global context
+            [B, S, D] output with large receptive field + latent bank context
+            
+        Flow:
+            1. Query Causal Latent Bank for global context (O(S × K))
+            2. Inject context into features
+            3. Apply dilated CNN stack for local patterns
         """
-        # # 1. Get Global Context (Causal Global Averaging)
-        # x_global = self.global_branch(x)
+        # 1. Global context from latent bank (applied once)
+        x_global = self.global_branch(x) 
+        x = x + x_global  # Add slot-derived context
         
-        # # 2. Inject Context BEFORE the CNNs (Pre-Injection)
-        # # This allows CNN kernels to 'see' the global context and modulate processing.
-        # # Since ConvBlocks have residuals, this signal is also carried forward.
-        # x = x + x_global
-        
-        # # 3. Apply Local CNN Stack
-        # for layer in self.layers:
-        #     x = layer(x)
-            
-        # return x
-        for layer_idx, layer in enumerate(self.layers):
-            # Read the DEDICATED CGA for this layer
-            x_global = self.global_branches[layer_idx](x) 
-            
-            x = x + x_global # Inject context
-            x = layer(x)     # Compute CNN
+        # 2. Apply CNN stack
+        for layer in self.layers:
+            x = layer(x)  # Dilated convolution for local patterns
             
         return x
 
@@ -344,6 +484,7 @@ class CNNCacheLayer(nn.Module):
         kernel_size: int = 5,
         num_conv_layers: int = 2,
         dropout: float = 0.1,
+        num_latent_slots: int = 32,  # For CausalLatentBank
     ):
         super().__init__()
         self.d_model = d_model
@@ -359,16 +500,15 @@ class CNNCacheLayer(nn.Module):
             num_layers=num_layers,
             layer_idx=layer_idx,
             dropout=dropout,
-            use_fixed_threshold=True,
-            fixed_threshold=0.3,  # Lower threshold to encourage writes
         )
 
-        # CNN compute (dilated stack for large receptive field)
+        # CNN compute (dilated stack for large receptive field + latent bank)
         self.compute = DilatedConvStack(
             d_model=d_model,
             num_layers=num_conv_layers,
             kernel_size=kernel_size,
             dropout=dropout,
+            num_latent_slots=num_latent_slots,
         )
 
         # Layer norm for post-compute

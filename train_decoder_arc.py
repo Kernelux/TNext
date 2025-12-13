@@ -796,9 +796,9 @@ def main():
         # batch_size = 1
         # num_epochs = 100
         # lr = 1e-4
-        d_model, d_cache = 128, 64
-        num_layers, num_slots = 6, 128  # Increased slots from 32 to 128
-        kernel_size, num_conv_layers = 5, 3
+        d_model, d_cache = 32, 16
+        num_layers, num_slots = 5, 32  # Increased slots from 32 to 192
+        kernel_size, num_conv_layers = 3, 5
         batch_size = 4
         num_epochs = 100
         lr = 1e-3

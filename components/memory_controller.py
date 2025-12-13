@@ -95,8 +95,18 @@ class MemoryController(nn.Module):
         num_layers: Total layers (for global cache indexing)
         layer_idx:  This layer's index (for local cache access)
         dropout:    Dropout probability
-        use_fixed_threshold: Use fixed 0.5 threshold instead of learned
-        fixed_threshold: Value for fixed threshold (default 0.5)
+        
+    Gating Mechanisms (v0.3.0 - Griffin + xLSTM inspired):
+    -----------------------------------------------------
+    READ GATE (Griffin RG-LRU style):
+        - Continuous exponential gating: a_t = a^(c·r_t)
+        - Biased toward retention (using cache by default)
+        - Smooth gradients, no hard thresholds
+        
+    WRITE GATE (xLSTM exponential style):
+        - Exponential importance: exp(score) for winner-take-all
+        - Sharp competition: most important tokens win slots
+        - Normalized across positions for each slot
     """
 
     def __init__(
@@ -109,8 +119,6 @@ class MemoryController(nn.Module):
         dropout: float = 0.1,
         max_iterations: int = 4,  # For temporal embeddings
         max_passes: int = 6,      # For temporal embeddings
-        use_fixed_threshold: bool = True,
-        fixed_threshold: float = 0.5,
         soft_eviction: bool = False,  # New parameter: True=Blend, False=Hard Replace
     ):
         super().__init__()
@@ -120,8 +128,6 @@ class MemoryController(nn.Module):
         self.num_layers = num_layers
         self.layer_idx = layer_idx
         self.total_slots = num_layers * num_slots
-        self.use_fixed_threshold = use_fixed_threshold
-        self.fixed_threshold = fixed_threshold
         self.soft_eviction = soft_eviction
         
         # === Slot Metadata Dimensions (from centralized config) ===
@@ -144,65 +150,76 @@ class MemoryController(nn.Module):
         # Fusion layer for mixing input and memory context
         self.fusion_layer = nn.Linear(d_model * 2, d_model)
 
-        # === READ Components ===
+        # === READ Components (Griffin RG-LRU Style) ===
         # Query generator: input → cache space query
         self.read_query = nn.Linear(d_model, d_cache)
 
-        # Read gate: INPUT-ONLY decision on whether this token needs context
-        # Per spec: "σ(W_r · x) - Does this token need context?"
-        # Decision happens BEFORE attending to cache - pure input-driven
-        self.read_gate = nn.Sequential(
+        # Griffin-style exponential gating for READ
+        # Instead of: gate > threshold → binary decision
+        # We use: a^(c·r_t) → continuous interpolation biased toward retention
+        #
+        # r_t ≈ 0 → a_t ≈ 1 → USE CACHE (preserve memory)
+        # r_t ≈ 1 → a_t ≈ a^c (small) → USE INPUT (reset to fresh input)
+        #
+        # Key insight: This biases toward using cache by default,
+        # which is good for memory systems.
+        
+        # Recurrence gate: r_t = σ(W_r · x)
+        self.read_recurrence_gate = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model // 2),
             nn.SiLU(),
             nn.Linear(d_model // 2, 1),
         )
+        
+        # Base decay factor: a = σ(Λ), learnable
+        # Initialized so a ∈ [0.9, 0.999] like Griffin
+        self.read_log_decay = nn.Parameter(torch.tensor(2.0))  # σ(2) ≈ 0.88
+        
+        # Exponent multiplier c (Griffin uses c=8)
+        self.read_gate_c = 8.0
 
         # === WRITE Components ===
         # Write query: output → cache space for slot selection
         self.write_query = nn.Linear(d_model, d_cache)
 
-        # Importance scorer: how valuable is this content intrinsically?
-        # Used for weighting token contributions during collision (multi-token → same slot)
+        # === WRITE Components (xLSTM Exponential Style) ===
+        # xLSTM-style exponential gating for importance scoring
+        # Instead of: sigmoid(score) → bounded (0, 1)
+        # We use: exp(score) → unbounded, then normalize
+        #
+        # Key insight: Exponential allows "100x more important" patterns
+        # to dominate slot selection (winner-take-all dynamics)
+        
+        # Importance scorer: exp(W · x) for winner-take-all
+        # Note: We compute exp() in forward, not here
         self.importance_scorer = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model // 2),
             nn.SiLU(),
             nn.Linear(d_model // 2, 1),
-            nn.Sigmoid(),
+            # NO sigmoid - we'll use exp() in forward for xLSTM-style
         )
+        
+        # Normalizer state for xLSTM-style stability
+        # m_t = max(|f_t| · m_{t-1}, |i_t|)
+        # We track running max for numerical stability
+        self.register_buffer('importance_normalizer', torch.tensor(1.0))
 
-        # === Unified Write Decision Gate ===
-        # Single gate that decides whether to write by comparing output to cache.
-        # Input: [output_in_cache_space, retrieved_cache_context] → binary decision
-        # This replaces separate write_gate (output-only) + novelty_gate (comparison)
-        # The comparison IS the decision: "Is this worth writing given what's already stored?"
+        # === Write Decision Gate (xLSTM-style) ===
+        # Exponential gating for write decision
+        # exp(score) creates sharp competition between tokens
         self.write_decision = nn.Sequential(
             nn.LayerNorm(d_cache * 2),
             nn.Linear(d_cache * 2, d_cache),
             nn.SiLU(),
             nn.Linear(d_cache, 1),
+            # NO sigmoid - we'll use exp() for xLSTM-style
         )
         
-        # === Learned Thresholds (context-dependent) ===
-        # Instead of hardcoded 0.5, learn context-dependent thresholds.
-        # This allows stricter/looser gating based on the situation.
-        
-        # Write threshold: based on cache context (stricter if cache has good info)
-        self.write_threshold = nn.Sequential(
-            nn.Linear(d_cache, d_cache // 2),
-            nn.SiLU(),
-            nn.Linear(d_cache // 2, 1),
-            nn.Sigmoid(),  # Output in [0, 1]
-        )
-        
-        # Read threshold: based on input (stricter if input is self-sufficient)
-        self.read_threshold = nn.Sequential(
-            nn.Linear(d_model, d_model // 4),
-            nn.SiLU(),
-            nn.Linear(d_model // 4, 1),
-            nn.Sigmoid(),  # Output in [0, 1]
-        )
+        # Temperature for write decision sharpness (learnable)
+        # Higher = sharper decisions (more winner-take-all)
+        self.write_temperature = nn.Parameter(torch.tensor(1.0))
         
         # NOTE: Token collision handling uses importance-weighted averaging.
         # When multiple tokens write to the same slot, their content is merged
@@ -226,8 +243,7 @@ class MemoryController(nn.Module):
                 nn.init.zeros_(module.bias)
 
         # Sequential modules
-        for seq in [self.read_gate, self.importance_scorer, self.write_decision,
-                    self.write_threshold, self.read_threshold]:
+        for seq in [self.read_recurrence_gate, self.importance_scorer, self.write_decision]:
             for m in seq:
                 if isinstance(m, nn.Linear):
                     nn.init.xavier_uniform_(m.weight)
@@ -237,17 +253,15 @@ class MemoryController(nn.Module):
                     nn.init.ones_(m.weight)
                     nn.init.zeros_(m.bias)
         
-        # Bias write_decision to start positive (encourage writes early)
-        # sigmoid(0.5) ≈ 0.62, so writes will start above the 0.3 threshold
+        # Bias read_recurrence_gate to start near 0.5 (neutral)
+        # This gives moderate context incorporation initially
+        if self.read_recurrence_gate[-1].bias is not None:
+            nn.init.zeros_(self.read_recurrence_gate[-1].bias)  # sigmoid(0) = 0.5
+        
+        # Bias write_decision to start slightly positive 
+        # With exp gating: exp(0.5)/(1+exp(0.5)) ≈ 0.62
         if self.write_decision[-1].bias is not None:
             nn.init.constant_(self.write_decision[-1].bias, 0.5)
-        
-        # Bias threshold networks to start near 0.5
-        # This gives neutral initial behavior
-        if self.write_threshold[-2].bias is not None:
-            nn.init.zeros_(self.write_threshold[-2].bias)  # sigmoid(0) = 0.5
-        if self.read_threshold[-2].bias is not None:
-            nn.init.zeros_(self.read_threshold[-2].bias)  # sigmoid(0) = 0.5
         
         # Initialize temporal embeddings
         nn.init.normal_(self.layer_embed.weight, std=0.02)
@@ -380,26 +394,30 @@ class MemoryController(nn.Module):
         """
         B, S, _ = x.shape
 
-        # === Step 1: Compute read gate from INPUT ONLY (before attending) ===
-        # Per spec: "σ(W_r · x) - Does this token need context?"
-        gate_logit = self.read_gate(x)  # [B, S, 1]
-        soft_gate = torch.sigmoid(gate_logit)
+        # === Step 1: Griffin RG-LRU Style Read Gating ===
+        # Instead of binary threshold, use continuous exponential decay gating
+        # a_t = a^(c * r_t) where:
+        #   - a = sigmoid(log_decay) is base retention (learnable, initialized ~0.88)
+        #   - r_t = sigmoid(W_r · x) in [0, 1] is input-dependent gate
+        #   - c = 8.0 scales the effective decay range
+        # When r_t ≈ 1: a_t ≈ a^c ≈ 0.35 (strong context incorporation)
+        # When r_t ≈ 0: a_t ≈ 1 (keep input unchanged)
         
-        # Threshold: fixed or learned
-        if self.use_fixed_threshold:
-            # Fixed threshold - forces gate VALUES to be decisive
-            # Polarization loss will push soft_gate to 0 or 1
-            read_thresh = torch.full_like(soft_gate, self.fixed_threshold)
-        else:
-            # Learned context-dependent threshold
-            read_thresh = self.read_threshold(x)  # [B, S, 1] in [0, 1]
-
+        r_t = self.read_recurrence_gate(x)  # [B, S, 1] - sigmoid already applied
+        base_retention = torch.sigmoid(self.read_log_decay)  # scalar ~0.88
+        # Compute a_t = a^(c * r_t) = exp(c * r_t * log(a))
+        log_base = torch.log(base_retention + 1e-8)  # negative value
+        read_gate = torch.exp(self.read_gate_c * r_t * log_base)  # [B, S, 1] in (0, 1)
+        # read_gate close to 1 means "keep x", close to 0 means "use context"
+        # We want the OPPOSITE: gate=1 means use context, so flip it
+        read_gate = 1.0 - read_gate
+        
+        # For hard inference, threshold at 0.5
         if hard or not self.training:
-            read_gate = (soft_gate > read_thresh).float()
-        else:
-            # STE: hard forward, soft backward
-            hard_gate = (soft_gate > read_thresh).float()
-            read_gate = hard_gate - soft_gate.detach() + soft_gate
+            read_gate = (read_gate > 0.5).float()
+        
+        # Store soft gate for potential losses
+        soft_gate = read_gate if self.training else read_gate
 
         # === Step 2: Only attend if gate is open (sparse optimization possible) ===
         # Generate read query from input
@@ -432,8 +450,8 @@ class MemoryController(nn.Module):
             'x_enhanced': x_enhanced,
             'context': context,
             'read_gate': read_gate,
-            'soft_read_gate': soft_gate,  # For polarization loss (pre-threshold)
-            'read_threshold': read_thresh,  # Include threshold tensor for gradient flow
+            'soft_read_gate': soft_gate,  # For losses (continuous in Griffin style)
+            'r_t': r_t,  # Raw recurrence gate value for debugging
             'attn_weights': attn_weights,
         }
 
@@ -493,33 +511,38 @@ class MemoryController(nn.Module):
         # Project tokens to cache space
         tokens_cache = self.to_cache(tokens)  # [B, T, D_cache]
 
-        # === Step 1: Importance Scoring (for token collision weighting) ===
-        importance = self.importance_scorer(tokens)  # [B, T, 1]
+        # === Step 1: xLSTM-style Exponential Importance Scoring ===
+        # Instead of bounded sigmoid, use exp() for unbounded importance
+        # Then normalize across tokens for stable gradients (like softmax but for importance)
+        importance_logit = self.importance_scorer(tokens)  # [B, T, 1] - raw score
+        # Temperature-scaled exponential: exp(logit / temperature)
+        importance_raw = torch.exp(importance_logit / self.write_temperature)  # [B, T, 1]
+        # Normalize across sequence for numerical stability
+        # This creates a "competition" between tokens for importance
+        importance = importance_raw / (importance_raw.sum(dim=1, keepdim=True) + self.importance_normalizer)
+        # Re-scale to reasonable magnitude
+        importance = importance * tokens.shape[1]  # Scale by sequence length
 
-        # === Step 2: Write Decision (unified gate comparing output to cache) ===
-        # Single gate that answers: "Is this worth writing given what's already stored?"
+        # === Step 2: xLSTM-style Write Decision ===
+        # Use exp() gating instead of sigmoid for winner-take-all dynamics
         # Compare output to what it would retrieve from cache
         context_cache, _ = self._attend_to_cache(tokens_cache, old_content)
         combined = torch.cat([tokens_cache, context_cache], dim=-1)  # [B, T, 2*D_cache]
         decision_logit = self.write_decision(combined)  # [B, T, 1]
-        soft_decision = torch.sigmoid(decision_logit)
         
-        # Threshold: fixed or learned
-        if self.use_fixed_threshold:
-            # Fixed threshold - forces gate VALUES to be decisive
-            # Polarization loss will push soft_decision to 0 or 1
-            write_thresh = torch.full_like(soft_decision, self.fixed_threshold)
-        else:
-            # Learned context-dependent threshold (based on cache context)
-            # Stricter threshold if cache already has relevant info
-            write_thresh = self.write_threshold(context_cache)  # [B, T, 1] in [0, 1]
-
+        # xLSTM-style exponential gating with temperature scaling
+        # High logit → strong write signal, low logit → weak write
+        decision_exp = torch.exp(decision_logit / self.write_temperature)  # [B, T, 1]
+        # Sigmoid-like normalization: exp(x) / (1 + exp(x)) = sigmoid(x)
+        # But we use temperature-scaled version for sharper transitions
+        soft_decision = decision_exp / (1.0 + decision_exp)  # [B, T, 1] in (0, 1)
+        
+        # For hard gating (inference), threshold at 0.5
         if hard or not self.training:
-            write_gate = (soft_decision > write_thresh).float()
+            write_gate = (soft_decision > 0.5).float()
         else:
-            # STE: hard forward, soft backward
-            hard_gate = (soft_decision > write_thresh).float()
-            write_gate = hard_gate - soft_decision.detach() + soft_decision
+            # Smooth gating during training - no STE needed with exp gating
+            write_gate = soft_decision
 
         # === Apply Mask (Prevent writing on padding) ===
         if mask is not None:
@@ -622,9 +645,8 @@ class MemoryController(nn.Module):
         return {
             'updated_cache': updated_cache,
             'write_gate': write_gate,
-            'soft_write_gate': soft_decision,  # For polarization loss (pre-threshold)
-            'write_threshold': write_thresh,  # Include threshold tensor for gradient flow
-            'write_decision': soft_decision,  # For debugging/analysis (alias)
+            'soft_write_gate': soft_decision,  # Continuous gate for losses
+            'decision_logit': decision_logit,  # Raw logit before exp gating
             'importance': importance,
             'slot_probs': slot_probs,
             'num_writes': write_gate.sum(dim=1).squeeze(-1),  # [B]

@@ -13,6 +13,7 @@ from .memory_controller import (
     LayerHaltEstimator,   # Per-layer halting (hidden state stability)
     ModelHaltEstimator,   # Model-level halting (entropy-based)
 )
+from .volatile_memory import VolatileMemoryController
 from .unified_layer import UnifiedMemoryLayer, ComputeBlock
 from .recursive_refinement_model import RecursiveRefinementModel
 from .cnn_cache_model import CNNCacheModel, create_cnn_cache_model

@@ -154,8 +154,6 @@ class UnifiedMemoryLayer(nn.Module):
         dropout: float = 0.1,
         use_linear_attention: bool = True,
         use_checkpoint: bool = False,  # Gradient checkpointing for memory savings
-        use_fixed_threshold: bool = True,  # Use fixed 0.5 threshold for gates
-        fixed_threshold: float = 0.5,       # Fixed threshold value
     ):
         super().__init__()
         self.d_model = d_model
@@ -174,8 +172,6 @@ class UnifiedMemoryLayer(nn.Module):
             num_layers=num_layers,
             layer_idx=layer_idx,
             dropout=dropout,
-            use_fixed_threshold=use_fixed_threshold,
-            fixed_threshold=fixed_threshold,
         )
         
         # Compute Block (handles all computation)

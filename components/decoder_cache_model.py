@@ -37,6 +37,7 @@ from typing import Optional, Tuple, Dict, List
 
 from .config import TrainingConfig, FeatureFlags, SLOT_DIMS
 from .memory_controller import MemoryController
+from .volatile_memory import VolatileMemoryController
 from .modules import CacheSelfAttention
 
 # Reuse CNN building blocks from cnn_cache_model
@@ -49,20 +50,24 @@ from .cnn_cache_model import CausalConv1d, ConvBlock, DilatedConvStack
 
 class DecoderCacheLayer(nn.Module):
     """
-    Decoder layer with causal CNN + cache memory.
+    Decoder layer with causal CNN + dual memory system.
     
-    Simplified from CNNCacheLayer:
-    - No iteration embedding (single pass)
-    - Same Read → Compute → Write flow
-    - Causal CNN ensures autoregressive generation
+    Memory Systems:
+    - LTM (Long-Term Memory): Persistent cache for rules/patterns
+    - WM (Working Memory): Volatile clipboard for intermediate values
     
     Flow:
         Input x
             │
             ▼
         ┌─────────────────┐
-        │ CACHE READ      │ ← Query global cache for context
+        │ LTM READ        │ ← Query global cache for patterns/rules
         └────────┬────────┘
+                 │
+                 ▼
+        ┌─────────────────┐
+        │ WM READ         │ ← Query working memory (clipboard)
+        └────────┬────────┘   (decays slot after read)
                  │
                  ▼
         ┌─────────────────┐
@@ -71,7 +76,12 @@ class DecoderCacheLayer(nn.Module):
                  │
                  ▼
         ┌─────────────────┐
-        │ CACHE WRITE     │ ← Store important patterns locally
+        │ WM WRITE        │ ← Store to clipboard (hard overwrite)
+        └────────┬────────┘
+                 │
+                 ▼
+        ┌─────────────────┐
+        │ LTM WRITE       │ ← Store important patterns (soft blend)
         └─────────────────┘
     """
     
@@ -86,14 +96,17 @@ class DecoderCacheLayer(nn.Module):
         num_conv_layers: int = 2,
         dropout: float = 0.1,
         soft_eviction: bool = False,
+        num_latent_slots: int = 32,  # For CausalLatentBank
+        num_wm_slots: int = 8,  # Working memory slots (smaller than LTM)
     ):
         super().__init__()
         self.d_model = d_model
         self.d_cache = d_cache
         self.num_slots = num_slots
+        self.num_wm_slots = num_wm_slots
         self.layer_idx = layer_idx
         
-        # Memory Controller (handles cache read/write)
+        # Long-Term Memory Controller (handles cache read/write)
         self.memory = MemoryController(
             d_model=d_model,
             d_cache=d_cache,
@@ -101,17 +114,25 @@ class DecoderCacheLayer(nn.Module):
             num_layers=num_layers,
             layer_idx=layer_idx,
             dropout=dropout,
-            use_fixed_threshold=True,
-            fixed_threshold=0.5,
             soft_eviction=soft_eviction,
         )
         
-        # Causal CNN compute
+        # Working Memory Controller (volatile clipboard)
+        self.working_memory = VolatileMemoryController(
+            d_model=d_model,
+            d_slot=d_cache,  # Same slot size as LTM for simplicity
+            num_slots=num_wm_slots,
+            dropout=dropout,
+            read_decay=0.3,  # Decay on read (use-once semantics)
+        )
+        
+        # Causal CNN compute with Latent Bank for global context
         self.compute = DilatedConvStack(
             d_model=d_model,
             num_layers=num_conv_layers,
             kernel_size=kernel_size,
             dropout=dropout,
+            num_latent_slots=num_latent_slots,
         )
         
         # Layer norm for post-compute
@@ -119,7 +140,7 @@ class DecoderCacheLayer(nn.Module):
         
         # Cache self-attention for memory consolidation
         d_slot = SLOT_DIMS.d_slot(d_cache)
-        
+
         # Find valid num_heads that divides d_slot evenly
         cache_attn_heads = 1
         for h in [5, 13]:
@@ -137,36 +158,56 @@ class DecoderCacheLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,                # [B, S, D]
-        cache: torch.Tensor,            # [B, L*K, D_slot]
+        cache: torch.Tensor,            # [B, L*K, D_slot] - Long-term memory
+        wm: torch.Tensor,               # [B, K_wm, D_wm_slot] - Working memory
         temperature: float = 1.0,
         hard: bool = False,
         cache_layer_embed: Optional[nn.Embedding] = None,
         mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
         """
-        Forward pass: Read → Compute → Write
+        Forward pass: LTM Read → WM Read → Compute → WM Write → LTM Write
         
         Returns:
             output: [B, S, D] processed features
-            updated_cache: [B, L*K, D_slot]
+            updated_cache: [B, L*K, D_slot] - Updated long-term memory
+            updated_wm: [B, K_wm, D_wm_slot] - Updated working memory
             aux: auxiliary info (gates for monitoring)
         """
-        # === CACHE READ: Get global context ===
-        read_result = self.memory.read(
+        # === LTM READ: Get global context from long-term memory ===
+        ltm_read_result = self.memory.read(
             x=x,
             cache=cache,
             use_global=True,
             temperature=temperature,
             hard=hard,
         )
-        x_enhanced = read_result['x_enhanced']
+        x_ltm = ltm_read_result['x_enhanced']
+        
+        # === WM READ: Get context from working memory (clipboard) ===
+        wm_read_result = self.working_memory.read(
+            x=x_ltm,
+            wm=wm,
+            hard=hard,
+        )
+        x_enhanced = wm_read_result['x_enhanced']
+        wm_after_read = wm_read_result['wm_updated']  # Freshness decayed
         
         # === CAUSAL CNN COMPUTE ===
         output = self.compute(x_enhanced)
         output = self.post_norm(output)
 
-        # === CACHE WRITE: Store important patterns ===
-        write_result = self.memory.write(
+        # === WM WRITE: Store to clipboard (hard overwrite, use-once) ===
+        wm_write_result = self.working_memory.write(
+            x=output,
+            wm=wm_after_read,
+            hard=hard,
+            mask=mask,
+        )
+        updated_wm = wm_write_result['wm_updated']
+
+        # === LTM WRITE: Store important patterns to long-term memory ===
+        ltm_write_result = self.memory.write(
             output=output,
             cache=cache,
             temperature=temperature,
@@ -178,20 +219,24 @@ class DecoderCacheLayer(nn.Module):
             cache_pass_embed=None,
             mask=mask,
         )
-        updated_cache = write_result['updated_cache']
+        updated_cache = ltm_write_result['updated_cache']
         
-        # === CACHE SELF-ATTENTION ===
+        # === CACHE SELF-ATTENTION (LTM only) ===
         updated_cache = self.cache_self_attn(updated_cache)
         
         # Auxiliary info for monitoring
         aux = {
-            'read_gate': read_result['read_gate'].detach().mean().item(),
-            'write_gate': write_result['write_gate'].detach().mean().item(),
-            'read_gate_tensor': read_result['read_gate'],
-            'write_gate_tensor': write_result['write_gate'],
+            'ltm_read_gate': ltm_read_result['read_gate'].detach().mean().item(),
+            'ltm_write_gate': ltm_write_result['write_gate'].detach().mean().item(),
+            'wm_read_gate': wm_read_result['read_gate'].detach().mean().item(),
+            'wm_write_gate': wm_write_result['write_gate'].detach().mean().item(),
+            'ltm_read_gate_tensor': ltm_read_result['read_gate'],
+            'ltm_write_gate_tensor': ltm_write_result['write_gate'],
+            'wm_read_gate_tensor': wm_read_result['read_gate'],
+            'wm_write_gate_tensor': wm_write_result['write_gate'],
         }
         
-        return output, updated_cache, aux
+        return output, updated_cache, updated_wm, aux
 
 
 # ============================================================================
@@ -228,6 +273,8 @@ class DecoderCacheModel(nn.Module):
         max_seq_len: int = 256,  # Total sequence length
         dropout: float = 0.1,
         soft_eviction: bool = False,
+        num_latent_slots: int = 32,  # For CausalLatentBank
+        num_wm_slots: int = 8,  # Working memory slots per layer
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -235,8 +282,13 @@ class DecoderCacheModel(nn.Module):
         self.d_cache = d_cache
         self.num_layers = num_layers
         self.num_slots = num_slots
+        self.num_wm_slots = num_wm_slots
         self.total_slots = num_layers * num_slots
         self.soft_eviction = soft_eviction
+        self.num_latent_slots = num_latent_slots
+        
+        # Working memory slot dimensions (content + freshness)
+        self.d_wm_slot = d_cache + 1
         
         # Slot dimensions from config
         self.d_meta = SLOT_DIMS.d_meta
@@ -287,6 +339,8 @@ class DecoderCacheModel(nn.Module):
                 num_conv_layers=num_conv_layers_per_block,
                 dropout=dropout,
                 soft_eviction=soft_eviction,
+                num_latent_slots=num_latent_slots,
+                num_wm_slots=num_wm_slots,
             )
             for i in range(num_layers)
         ])
@@ -333,6 +387,19 @@ class DecoderCacheModel(nn.Module):
         cache = torch.cat([content, metadata], dim=-1)
         
         return cache
+    
+    def get_initial_wm(self, batch_size: int, device: torch.device) -> List[torch.Tensor]:
+        """
+        Initialize working memory for all layers.
+        
+        Returns:
+            List of [B, num_wm_slots, d_wm_slot] tensors, one per layer.
+            Working memory starts empty (all zeros, freshness=0).
+        """
+        return [
+            torch.zeros(batch_size, self.num_wm_slots, self.d_wm_slot, device=device)
+            for _ in range(self.num_layers)
+        ]
     
     def embed_sequence(
         self,
@@ -476,26 +543,32 @@ class DecoderCacheModel(nn.Module):
         h = torch.cat(all_parts, dim=1)  # [B, total_len, D]
         write_mask = torch.cat(all_masks, dim=1)  # [B, total_len, 1]
         
-        # === Initialize cache ===
+        # === Initialize memories ===
         cache = self.get_initial_cache(B, device)
+        wm_states = self.get_initial_wm(B, device)  # List of [B, K_wm, D_wm] per layer
         
         # === Process through decoder layers ===
         aux = {
-            'read_gates': [],
-            'write_gates': [],
+            'ltm_read_gates': [],
+            'ltm_write_gates': [],
+            'wm_read_gates': [],
+            'wm_write_gates': [],
         }
         
         for layer_idx, layer in enumerate(self.layers):
-            h, cache, layer_aux = layer(
+            h, cache, wm_states[layer_idx], layer_aux = layer(
                 x=h,
                 cache=cache,
+                wm=wm_states[layer_idx],
                 temperature=temperature,
                 hard=hard,
                 cache_layer_embed=self.cache_layer_embed,
                 mask=write_mask,
             )
-            aux['read_gates'].append(layer_aux['read_gate_tensor'])
-            aux['write_gates'].append(layer_aux['write_gate_tensor'])
+            aux['ltm_read_gates'].append(layer_aux['ltm_read_gate_tensor'])
+            aux['ltm_write_gates'].append(layer_aux['ltm_write_gate_tensor'])
+            aux['wm_read_gates'].append(layer_aux['wm_read_gate_tensor'])
+            aux['wm_write_gates'].append(layer_aux['wm_write_gate_tensor'])
         
         # === Output projection ===
         h_out = self.output_norm(h)
@@ -587,10 +660,14 @@ class DecoderCacheModel(nn.Module):
             # (Optimization: Implement KV-cache and causal conv cache for O(N) generation)
             
             cache = self.get_initial_cache(B, device)
+            wm_states = self.get_initial_wm(B, device)
             h_step = current_input_emb
             
-            for layer in self.layers:
-                h_step, cache, _ = layer(h_step, cache, temperature=temperature, hard=True)
+            for layer_idx, layer in enumerate(self.layers):
+                h_step, cache, wm_states[layer_idx], _ = layer(
+                    h_step, cache, wm_states[layer_idx], 
+                    temperature=temperature, hard=True
+                )
             
             # 2. Predict next token from last position
             h_out = self.output_norm(h_step[:, -1:, :])
@@ -640,19 +717,19 @@ def create_decoder_cache_model(
     configs = {
         "debug": dict(
             d_model=32, d_cache=24, num_layers=2, num_slots=8,
-            kernel_size=3, num_conv_layers_per_block=1,
+            kernel_size=3, num_conv_layers_per_block=1, num_latent_slots=16,
         ),
         "fast": dict(
             d_model=64, d_cache=48, num_layers=3, num_slots=16,
-            kernel_size=5, num_conv_layers_per_block=2,
+            kernel_size=5, num_conv_layers_per_block=2, num_latent_slots=32,
         ),
         "medium": dict(
             d_model=96, d_cache=64, num_layers=4, num_slots=24,
-            kernel_size=5, num_conv_layers_per_block=2,
+            kernel_size=5, num_conv_layers_per_block=2, num_latent_slots=48,
         ),
         "full": dict(
             d_model=128, d_cache=64, num_layers=6, num_slots=32,
-            kernel_size=5, num_conv_layers_per_block=3,
+            kernel_size=5, num_conv_layers_per_block=3, num_latent_slots=64,
         ),
     }
     
