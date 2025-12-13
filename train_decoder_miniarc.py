@@ -1,24 +1,24 @@
 """
-Training Script for CNN + Cache Model on Mini-ARC
-=================================================
+Training Script for Decoder-Only CNN + Cache Model on Mini-ARC
+==============================================================
 
-This trains a 1D CNN model augmented with the DLSMN cache system.
-The goal is to show that cache can give CNNs transformer-like
-global reasoning capabilities.
+GPT-style decoder-only model with CNN compute blocks and selective cache memory.
+Single forward pass (no refinement) — efficient like modern LLMs.
 
-Key differences from transformer-based train_miniarc.py:
-- Uses 1D convolutions instead of self-attention for local processing
-- Cache provides global context (instead of O(N²) attention)
-- Potentially faster and more parameter-efficient
+Key Features:
+- Fully causal processing (autoregressive)
+- Teacher forcing during training
+- Cache provides global memory beyond CNN receptive field
+- Simple loss: CE on generation tokens + gate regularization
 
 Usage:
-    python train_cnn_miniarc.py [preset]
+    python train_decoder_miniarc.py [preset]
     
 Presets:
     debug   - Minimal for testing
-    fast    - Quick training iteration
+    fast    - Quick training (laptop-friendly)
+    medium  - Balanced performance
     full    - Best performance
-    compare - Same params as transformer for fair comparison
 """
 
 import torch
@@ -37,10 +37,9 @@ from components import (
     FeatureFlags,
     TrainingConfig,
     FEATURE_PRESETS,
-    EMA,
     AdamAtan2,
 )
-from components.cnn_cache_model import CNNCacheModel, create_cnn_cache_model
+from components.decoder_cache_model import DecoderCacheModel, create_decoder_cache_model
 from components.logging import MetricsLogger
 from components.miniarc_dataset import (
     MiniARCDataset,
@@ -50,7 +49,7 @@ from components.miniarc_dataset import (
 
 
 # ============================================================================
-# Visualization (same as train_miniarc.py)
+# Visualization
 # ============================================================================
 
 ARC_COLORS = {
@@ -89,16 +88,6 @@ def prediction_to_grid(prediction: np.ndarray, target: np.ndarray) -> np.ndarray
     return grid
 
 
-def grid_to_rgb(grid: np.ndarray, cell_size: int = 10) -> np.ndarray:
-    if isinstance(grid, torch.Tensor):
-        grid = grid.cpu().numpy()
-    grid = np.clip(grid, 0, 9).astype(np.int32)
-    rgb = ARC_PALETTE[grid]
-    if cell_size > 1:
-        rgb = np.repeat(np.repeat(rgb, cell_size, axis=0), cell_size, axis=1)
-    return rgb
-
-
 def visualize_sample(
     demo_inputs: torch.Tensor,
     demo_outputs: torch.Tensor,
@@ -111,17 +100,12 @@ def visualize_sample(
 ) -> str:
     lines = []
     lines.append(f"\n{'='*60}")
-    lines.append(f"[Step {step}] CNN+Cache Mini-ARC Sample #{sample_idx}")
+    lines.append(f"[Step {step}] Decoder+Cache Mini-ARC Sample #{sample_idx}")
     
     if aux:
-        M = aux.get('passes_run', 1)
-        K = aux.get('layer_iters', 1)
-        lines.append(f"  Passes (M): {M} | Layer Iters (K): {K}")
-        
         read_gates = aux.get('read_gates', [])
         write_gates = aux.get('write_gates', [])
         if read_gates:
-            # Gates are tensors, convert to scalar for display
             avg_read = sum(g.mean().item() for g in read_gates) / len(read_gates)
             lines.append(f"  Avg Read Gate: {avg_read:.3f}")
         if write_gates:
@@ -179,60 +163,33 @@ def visualize_sample(
 
 
 # ============================================================================
-# Loss Computation (Simple version for CNN + Cache)
+# Loss Computation
 # ============================================================================
 
 IGNORE_LABEL = -100
 
-def compute_cnn_loss(
-    model: CNNCacheModel,
-    logits: torch.Tensor,
-    targets: torch.Tensor,
+
+def compute_decoder_loss(
+    logits: torch.Tensor,       # [B, S, V]
+    targets: torch.Tensor,      # [B, S]
     aux: Dict,
-    config: TrainingConfig,
-    step: int,
     device: torch.device,
 ) -> Tuple[torch.Tensor, Dict]:
     """
-    Simple loss for CNN + Cache model.
+    Simple loss for decoder model.
     
     Components:
-    1. Task loss: Cross-entropy with deep supervision (train on all passes)
-    2. Gate usage loss: Encourage gates to be > 0 (prevent dead cache)
-    
-    This is intentionally simpler than the transformer loss to show
-    the cache mechanism works without complex halting machinery.
+    1. Task loss: Cross-entropy on generation tokens only
+    2. Gate usage loss: Encourage gates to be active (prevent dead cache)
     """
-    # === 1. TASK LOSS with deep supervision ===
-    pass_logits = aux.get('pass_logits', [])
-    if not pass_logits:
-        pass_logits = [logits.detach()]
+    # === 1. TASK LOSS ===
+    B, S, V = logits.shape
+    flat_logits = logits.reshape(-1, V)
+    flat_targets = targets.reshape(-1)
     
-    # Weight later passes more (they should be better)
-    num_passes = len(pass_logits)
-    pass_weights = [0.5 ** (num_passes - 1 - i) for i in range(num_passes)]
-    total_weight = sum(pass_weights)
-    pass_weights = [w / total_weight for w in pass_weights]
-    
-    task_loss = torch.tensor(0.0, device=device)
-    
-    for pass_idx, p_logits in enumerate(pass_logits):
-        # Ensure we use the version with gradients for the final pass
-        if pass_idx == len(pass_logits) - 1:
-            p_logits = logits  # Use original logits with gradients
-        
-        # Flatten for cross entropy
-        B, S, V = p_logits.shape
-        flat_logits = p_logits.reshape(-1, V)
-        flat_targets = targets.reshape(-1)
-        
-        # Cross entropy (ignores -100)
-        ce = F.cross_entropy(flat_logits, flat_targets, ignore_index=IGNORE_LABEL)
-        task_loss = task_loss + pass_weights[pass_idx] * ce
+    task_loss = F.cross_entropy(flat_logits, flat_targets, ignore_index=IGNORE_LABEL)
     
     # === 2. GATE USAGE LOSS ===
-    # Encourage gates to be used (prevent all-zero gates)
-    # This helps the cache actually store and retrieve information
     gate_loss = torch.tensor(0.0, device=device)
     avg_read = torch.tensor(0.0, device=device)
     avg_write = torch.tensor(0.0, device=device)
@@ -241,12 +198,10 @@ def compute_cnn_loss(
     write_gates = aux.get('write_gates', [])
     
     if read_gates:
-        # Average gate activation across all passes
         avg_read = torch.stack([g.mean() for g in read_gates]).mean()
         avg_write = torch.stack([g.mean() for g in write_gates]).mean() if write_gates else torch.tensor(0.0, device=device)
         
-        # Encourage gates to be around 0.3-0.5 (not too sparse, not too dense)
-        # Loss = 0 when gate ≈ 0.4, increases as it moves away
+        # Encourage gates to be around 0.4
         target_gate = 0.4
         read_gate_loss = (avg_read - target_gate).abs()
         write_gate_loss = (avg_write - target_gate).abs()
@@ -256,15 +211,13 @@ def compute_cnn_loss(
     # === 3. TOTAL LOSS ===
     total_loss = task_loss + gate_loss
     
-    # Metrics
+    # Metrics (detach before .item() to avoid warning)
     metrics = {
         'loss_total': total_loss.detach().item(),
         'loss_task': task_loss.detach().item(),
         'loss_gate': gate_loss.detach().item() if isinstance(gate_loss, torch.Tensor) else gate_loss,
-        'avg_read_gate': avg_read.item() if read_gates else 0.0,
-        'avg_write_gate': avg_write.item() if (read_gates and write_gates) else 0.0,
-        'passes_run': aux.get('passes_run', 1),
-        'layer_iters': aux.get('layer_iters', 1),
+        'avg_read_gate': avg_read.detach().item() if read_gates else 0.0,
+        'avg_write_gate': avg_write.detach().item() if (read_gates and write_gates) else 0.0,
     }
     
     return total_loss, metrics
@@ -275,28 +228,22 @@ def compute_cnn_loss(
 # ============================================================================
 
 def train_epoch(
-    model: CNNCacheModel,
+    model: DecoderCacheModel,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    config: TrainingConfig,
     global_step: int = 0,
     logger: Optional[MetricsLogger] = None,
     log_interval: int = 10,
-    max_passes: Optional[int] = None,
-    max_layer_iters: Optional[int] = None,
+    temperature: float = 1.0,
 ) -> Tuple[float, float, float, int]:
-    """Training epoch."""
+    """Training epoch with teacher forcing."""
     model.train()
     total_loss = 0
     correct_cells = 0
     total_cells = 0
     correct_tasks = 0
     total_tasks = 0
-    cell_acc = 0.0
-    task_acc = 0.0
-    
-    IGNORE_LABEL = -100
     
     pbar = tqdm(dataloader, desc="Train", leave=False)
     for batch_idx, batch in enumerate(pbar):
@@ -307,21 +254,16 @@ def train_epoch(
         
         optimizer.zero_grad()
         
-        # Forward (simple: fixed M passes, K layer iters)
+        # Forward with teacher forcing
         logits, cache, aux = model(
-            demo_inputs, demo_outputs, test_input,
-            config=config,
-            step=global_step,
+            demo_inputs, demo_outputs, test_input, test_output,
+            temperature=temperature,
+            hard=(temperature < 0.2),
             return_aux=True,
-            max_passes=max_passes,
-            max_layer_iters=max_layer_iters,
         )
         
         # Loss
-        loss, metrics = compute_cnn_loss(
-            model, logits, test_output,
-            aux, config, global_step, device
-        )
+        loss, metrics = compute_decoder_loss(logits, test_output, aux, device)
         
         # Backward
         loss.backward()
@@ -356,13 +298,33 @@ def train_epoch(
         cell_acc = correct_cells / max(total_cells, 1)
         task_acc = correct_tasks / max(total_tasks, 1)
         
-        # Logging
+        # Logging - convert gate tensors to format expected by logger
         if logger is not None and batch_idx % log_interval == 0:
+            # Aggregate gate stats for logging
+            read_gates = aux.get('read_gates', [])
+            write_gates = aux.get('write_gates', [])
+            
+            log_aux = {
+                'passes_run': 1,  # Single pass (decoder-only)
+            }
+            
+            if read_gates:
+                read_sum = sum(g.sum().item() for g in read_gates)
+                read_count = sum(g.numel() for g in read_gates)
+                log_aux['read_gate_sum'] = read_sum
+                log_aux['read_gate_count'] = read_count
+            
+            if write_gates:
+                write_sum = sum(g.sum().item() for g in write_gates)
+                write_count = sum(g.numel() for g in write_gates)
+                log_aux['write_gate_sum'] = write_sum
+                log_aux['write_gate_count'] = write_count
+            
             logger.log_step(
                 step=global_step,
                 metrics=metrics,
-                aux=aux,
-                config=config,
+                aux=log_aux,
+                config=None,
                 cell_acc=cell_acc,
                 task_acc=task_acc,
             )
@@ -382,13 +344,10 @@ def train_epoch(
             print(viz_str)
         
         # Progress bar
-        M = aux.get('passes_run', 1)
-        K = aux.get('layer_iters', 1)
         pbar.set_postfix({
             'loss': f'{loss_val:.3f}',
             'cell': f'{cell_acc:.3f}',
             'task': f'{task_acc:.3f}',
-            'M': M, 'K': K,
         })
         
         # Cleanup
@@ -409,31 +368,26 @@ def train_epoch(
 
 @torch.no_grad()
 def evaluate(
-    model: CNNCacheModel,
+    model: DecoderCacheModel,
     dataloader: DataLoader,
     device: torch.device,
-    config: TrainingConfig,
     global_step: int = 0,
     visualize_samples: int = 3,
+    use_generation: bool = False,
 ) -> Tuple[float, float]:
-    """Evaluation."""
+    """
+    Evaluation.
+    
+    Args:
+        use_generation: If True, use autoregressive generation (slower but realistic).
+                       If False, use teacher forcing (faster).
+    """
     model.eval()
     correct_tasks = 0
     total_tasks = 0
     correct_cells = 0
     total_cells = 0
     samples_visualized = 0
-    cell_acc = 0.0
-    task_acc = 0.0
-    
-    IGNORE_LABEL = -100
-    
-    eval_config = TrainingConfig(
-        tau_min=0.1,
-        tau_start=0.1,
-        max_passes=config.max_passes,
-        features=config.features,
-    )
     
     pbar = tqdm(dataloader, desc="Eval", leave=False)
     for batch in pbar:
@@ -442,14 +396,22 @@ def evaluate(
         test_input = batch["test_input"].to(device)
         test_output = batch["test_output"].to(device)
         
-        logits, _, aux = model(
-            demo_inputs, demo_outputs, test_input,
-            config=eval_config,
-            step=100000,
-            return_aux=True,
-        )
-        
-        preds = logits.argmax(dim=-1)
+        if use_generation:
+            # Autoregressive generation
+            preds = model.generate(
+                demo_inputs, demo_outputs, test_input,
+                max_len=test_output.shape[1],
+                temperature=0.0,  # Greedy
+            )
+        else:
+            # Teacher forcing (faster)
+            logits, _, aux = model(
+                demo_inputs, demo_outputs, test_input, test_output,
+                temperature=0.5,
+                hard=True,
+                return_aux=True,
+            )
+            preds = logits.argmax(dim=-1)
         
         for i in range(preds.shape[0]):
             valid_mask = (test_output[i] != IGNORE_LABEL)
@@ -472,7 +434,7 @@ def evaluate(
                         prediction=preds[i],
                         sample_idx=samples_visualized,
                         step=global_step,
-                        aux=aux,
+                        aux=aux if not use_generation else None,
                     )
                     print(viz_str)
                     samples_visualized += 1
@@ -527,85 +489,45 @@ def main():
     
     # Preset
     preset_name = sys.argv[1] if len(sys.argv) > 1 else "fast"
-    features = FEATURE_PRESETS.get(preset_name, FEATURE_PRESETS["fast"])
     print(f"\nUsing preset: '{preset_name}'")
-    print(f"Features: {features.describe()}")
     
-    # Model configuration per preset
-    # CNN + Cache version - Simple refinement with fixed M passes and K layer iters
-    # 
-    # Refinement parameters:
-    #   max_passes (M): Model-level refinement passes
-    #   max_layer_iters (K): Layer-level iterations per pass
-    #
-    # Default learning rate (can be overridden per-preset)
+    # Model configuration per preset (laptop-friendly defaults)
     lr = 5e-4
     
     if preset_name == "debug":
-        # Minimal config for debugging
         d_model, d_cache = 32, 24
         num_layers, num_slots = 2, 8
         kernel_size, num_conv_layers = 3, 1
-        batch_size = 16
-        max_passes = 2      # M
-        max_layer_iters = 1 # K
+        batch_size = 8
         num_epochs = 10
     elif preset_name == "fast":
-        # Quick training for iteration
         d_model, d_cache = 64, 48
         num_layers, num_slots = 3, 16
         kernel_size, num_conv_layers = 5, 2
-        batch_size = 32
-        max_passes = 3      # M
-        max_layer_iters = 1 # K
+        batch_size = 16
         num_epochs = 50
+    elif preset_name == "medium":
+        d_model, d_cache = 96, 64
+        num_layers, num_slots = 4, 24
+        kernel_size, num_conv_layers = 5, 2
+        batch_size = 8
+        num_epochs = 100
+        lr = 3e-4
     elif preset_name == "fast_full":
-        # Full features, moderate compute
-        d_model, d_cache = 64, 32
-        num_layers, num_slots = 8, 120  # (24 slots for each layer)
-        kernel_size, num_conv_layers = 3, 3
-        batch_size = 8
-        max_passes = 5      # M
-        max_layer_iters = 1 # K
-        num_epochs = 100
-    elif preset_name == "deep":
-        # More layer iterations for deeper refinement
-        d_model, d_cache = 64, 48
-        num_layers, num_slots = 4, 32
-        kernel_size, num_conv_layers = 5, 2
-        batch_size = 16
-        max_passes = 2      # M - fewer passes
-        max_layer_iters = 4 # K - more layer iters
-        num_epochs = 100
-        lr = 3e-4
-    elif preset_name == "wide":
-        # More passes, fewer layer iterations
-        d_model, d_cache = 64, 48
-        num_layers, num_slots = 4, 32
-        kernel_size, num_conv_layers = 5, 2
-        batch_size = 16
-        max_passes = 6      # M - more passes
-        max_layer_iters = 1 # K - single layer iter
-        num_epochs = 100
-        lr = 3e-4
-    elif preset_name == "compare":
-        # Direct comparison with transformer - matched params
-        d_model, d_cache = 64, 48
-        num_layers, num_slots = 4, 32
-        kernel_size, num_conv_layers = 5, 2
-        batch_size = 8
-        max_passes = 3      # M
-        max_layer_iters = 1 # K
-        num_epochs = 100
-    else:  # full
-        # Full model for best performance
+        # Larger model, quick epochs
         d_model, d_cache = 128, 64
-        num_layers, num_slots = 4, 32
+        num_layers, num_slots = 6, 32
         kernel_size, num_conv_layers = 5, 3
-        batch_size = 16
-        max_passes = 4      # M
-        max_layer_iters = 2 # K
+        batch_size = 4
         num_epochs = 100
+        lr = 2e-4
+    else:  # full
+        d_model, d_cache = 128, 64
+        num_layers, num_slots = 6, 32
+        kernel_size, num_conv_layers = 5, 3
+        batch_size = 4
+        num_epochs = 100
+        lr = 2e-4
     
     # Dataset
     dataset = MiniARCDataset(str(data_path), augment=True)
@@ -621,20 +543,12 @@ def main():
     eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
     
     print(f"\nTrain samples: {len(train_dataset)}, Eval samples: {len(eval_dataset)}")
-    print(f"CNN config: kernel={kernel_size}, conv_layers={num_conv_layers}")
-    print(f"Cache config: {num_layers} layers × {num_slots} slots")
-    print(f"Refinement: M={max_passes} model passes, K={max_layer_iters} layer iters")
-    
-    # Config
-    config = TrainingConfig(
-        tau_start=1.0,
-        tau_min=0.1,
-        max_passes=max_passes,
-        features=features,
-    )
+    print(f"Config: d_model={d_model}, d_cache={d_cache}")
+    print(f"        {num_layers} layers × {num_slots} slots")
+    print(f"        kernel={kernel_size}, conv_layers={num_conv_layers}")
     
     # Model
-    model = CNNCacheModel(
+    model = DecoderCacheModel(
         vocab_size=VOCAB_SIZE,
         d_model=d_model,
         d_cache=d_cache,
@@ -642,9 +556,7 @@ def main():
         num_slots=num_slots,
         kernel_size=kernel_size,
         num_conv_layers_per_block=num_conv_layers,
-        max_seq_len=MAX_SEQ_LEN,
-        max_passes=max_passes,
-        max_layer_iters=max_layer_iters,
+        max_seq_len=256,
         dropout=0.0,
     ).to(device)
     
@@ -659,21 +571,27 @@ def main():
     print(f"Using AdamAtan2 optimizer (lr={lr})")
     
     # Logging
-    log_dir = Path("logs") / f"cnn_cache_{preset_name}_{time.strftime('%Y%m%d_%H%M%S')}"
+    log_dir = Path("logs") / f"decoder_cache_{preset_name}_{time.strftime('%Y%m%d_%H%M%S')}"
+    log_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir)
     logger = MetricsLogger(writer)
     print(f"TensorBoard logs: {log_dir}")
+    
+    # Temperature schedule (anneal from 1.0 to 0.1)
+    def get_temperature(epoch: int, num_epochs: int) -> float:
+        return max(0.1, 1.0 - 0.9 * epoch / num_epochs)
     
     # Training
     best_task_acc = 0
     global_step = 0
     
     for epoch in range(num_epochs):
+        temperature = get_temperature(epoch, num_epochs)
+        
         train_loss, train_cell_acc, train_task_acc, global_step = train_epoch(
-            model, train_loader, optimizer, device, config, global_step,
+            model, train_loader, optimizer, device, global_step,
             logger=logger, log_interval=10,
-            max_passes=max_passes,
-            max_layer_iters=max_layer_iters,
+            temperature=temperature,
         )
         
         logger.log_epoch(epoch, train_loss, train_cell_acc, train_task_acc)
@@ -681,30 +599,41 @@ def main():
         # Evaluate every 5 epochs
         if (epoch + 1) % 5 == 0:
             eval_cell_acc, eval_task_acc = evaluate(
-                model, eval_loader, device, config,
+                model, eval_loader, device,
                 global_step=global_step, visualize_samples=2,
+                use_generation=False,  # Teacher forcing for speed
             )
             
-            # Save if improved (use >= for first save when both are 0)
             if eval_task_acc > best_task_acc or (eval_task_acc == 0 and best_task_acc == 0 and epoch == 4):
                 best_task_acc = max(eval_task_acc, best_task_acc)
                 torch.save(model.state_dict(), log_dir / "best_model.pt")
                 print(f"  → Saved best model (task_acc={eval_task_acc:.3f})")
             
             logger.log_epoch(epoch, train_loss, train_cell_acc, train_task_acc,
-                             eval_cell_acc=eval_cell_acc, eval_task_acc=eval_task_acc)
+                            eval_cell_acc=eval_cell_acc, eval_task_acc=eval_task_acc)
             
-            print(f"Epoch {epoch+1:3d} | Loss: {train_loss:.4f} | Eval Task: {eval_task_acc:.3f} | Best: {best_task_acc:.3f}")
+            print(f"Epoch {epoch+1:3d} | Loss: {train_loss:.4f} | Eval Task: {eval_task_acc:.3f} | Best: {best_task_acc:.3f} | τ: {temperature:.2f}")
         else:
-            print(f"Epoch {epoch+1:3d} | Loss: {train_loss:.4f} | Train Task: {train_task_acc:.3f}")
+            print(f"Epoch {epoch+1:3d} | Loss: {train_loss:.4f} | Train Task: {train_task_acc:.3f} | τ: {temperature:.2f}")
     
-    # Always save final model
+    # Final evaluation with autoregressive generation
+    print("\n" + "="*60)
+    print("Final evaluation with autoregressive generation...")
+    print("="*60)
+    eval_cell_acc, eval_task_acc = evaluate(
+        model, eval_loader, device,
+        global_step=global_step, visualize_samples=5,
+        use_generation=True,  # True autoregressive
+    )
+    print(f"Autoregressive Eval: Cell={eval_cell_acc:.3f}, Task={eval_task_acc:.3f}")
+    
+    # Save final model
     torch.save(model.state_dict(), log_dir / "final_model.pt")
     print(f"  → Saved final model")
     
     logger.close()
     print(f"\n{'='*60}")
-    print(f"CNN + Cache Training Complete!")
+    print(f"Decoder + Cache Training Complete!")
     print(f"Best task accuracy: {best_task_acc:.3f}")
     print(f"{'='*60}")
 

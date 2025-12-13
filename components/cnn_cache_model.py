@@ -92,32 +92,47 @@ class CausalConv1d(nn.Module):
 
 class ConvBlock(nn.Module):
     """
-    Single convolutional block with residual connection.
-
-    Structure: LayerNorm → Conv → GELU → Conv → Dropout + Residual
-
-    This is the "local pattern detector" - the CNN equivalent of FFN in transformers.
+    Sandglass-style convolutional block with residual connection.
+    
+    Based on MobileNeXt (2020): https://arxiv.org/abs/2007.02269
+    
+    Structure: LayerNorm → DW Conv (high-D) → GELU → Compress → Expand → Dropout + Residual
+    
+    Key improvements over Inverted Bottleneck:
+    1. Depthwise conv on HIGH-dimensional space (richer spatial features)
+    2. HIGH-dimensional shortcut (better gradient flow)
+    3. Compression bottleneck in the MIDDLE (parameter efficiency)
+    
+    Flow: d → DW(d) → d/r → d (where r=2 is reduction ratio)
+    
+    This achieves +1.7% accuracy over MobileNetV2 with same params/FLOPs.
     """
 
     def __init__(
         self,
         d_model: int,
         kernel_size: int = 5,
-        expansion: int = 2,
+        reduction: int = 2,  # Sandglass: compress by this factor
         dropout: float = 0.1,
         dilation: int = 1,
     ):
         super().__init__()
-        d_inner = d_model * expansion
+        d_bottleneck = d_model // reduction
 
         self.norm = nn.LayerNorm(d_model)
 
-        # Depthwise separable convolution for efficiency
-        # First: expand channels
-        self.conv1 = CausalConv1d(d_model, d_inner, kernel_size, dilation=dilation)
-
-        # Second: project back
-        self.conv2 = CausalConv1d(d_inner, d_model, 1)  # 1x1 conv = linear projection
+        # === SANDGLASS STRUCTURE ===
+        # 1. Depthwise conv on HIGH-D space (spatial features on rich representation)
+        self.dw_conv = CausalConv1d(
+            d_model, d_model, kernel_size, 
+            dilation=dilation, groups=d_model  # Depthwise: each channel independently
+        )
+        
+        # 2. Compress to bottleneck (1x1 pointwise)
+        self.compress = nn.Conv1d(d_model, d_bottleneck, 1)
+        
+        # 3. Expand back to original dim (1x1 pointwise) 
+        self.expand = nn.Conv1d(d_bottleneck, d_model, 1)
 
         self.act = nn.GELU()
         self.dropout = nn.Dropout(dropout)
@@ -129,22 +144,26 @@ class ConvBlock(nn.Module):
         Returns:
             [B, S, D] output
         """
-        residual = x
+        residual = x  # HIGH-D shortcut (key for gradient flow)
 
         # LayerNorm expects [B, S, D]
         x = self.norm(x)
 
         # Conv expects [B, D, S]
         x = x.transpose(1, 2)
-        x = self.conv1(x)
+        
+        # Sandglass: DW on high-D → compress → expand
+        x = self.dw_conv(x)      # Spatial features on rich representation
         x = self.act(x)
-        x = self.conv2(x)
+        x = self.compress(x)     # Bottleneck (information compression)
+        x = self.act(x)
+        x = self.expand(x)       # Restore dimensionality
         x = self.dropout(x)
 
         # Back to [B, S, D]
         x = x.transpose(1, 2)
 
-        return x + residual
+        return x + residual  # HIGH-D residual connection
 
 
 class DilatedConvStack(nn.Module):
@@ -170,7 +189,7 @@ class DilatedConvStack(nn.Module):
             ConvBlock(
                 d_model=d_model,
                 kernel_size=kernel_size,
-                #dilation=2**i,  # Exponential dilation
+                dilation=2**i,  # Exponential dilation
                 dropout=dropout,
             )
             for i in range(num_layers)
@@ -281,7 +300,7 @@ class CNNCacheLayer(nn.Module):
             d_cache=d_slot,  # Full slot dimension (content + metadata)
             num_heads=cache_attn_heads,
             dropout=dropout,
-            use_linear=True,
+            use_linear=False,
         )
 
         # Iteration embedding (for recursive refinement)

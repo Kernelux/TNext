@@ -111,6 +111,7 @@ class MemoryController(nn.Module):
         max_passes: int = 6,      # For temporal embeddings
         use_fixed_threshold: bool = True,
         fixed_threshold: float = 0.5,
+        soft_eviction: bool = False,  # New parameter: True=Blend, False=Hard Replace
     ):
         super().__init__()
         self.d_model = d_model
@@ -121,6 +122,7 @@ class MemoryController(nn.Module):
         self.total_slots = num_layers * num_slots
         self.use_fixed_threshold = use_fixed_threshold
         self.fixed_threshold = fixed_threshold
+        self.soft_eviction = soft_eviction
         
         # === Slot Metadata Dimensions (from centralized config) ===
         self.d_layer_embed = SLOT_DIMS.d_layer_embed
@@ -138,6 +140,9 @@ class MemoryController(nn.Module):
         self.to_cache = nn.Linear(d_model, d_cache)
         # from_cache now takes content + metadata (confidence as feature)
         self.from_cache = nn.Linear(self.d_slot, d_model)
+        
+        # Fusion layer for mixing input and memory context
+        self.fusion_layer = nn.Linear(d_model * 2, d_model)
 
         # === READ Components ===
         # Query generator: input → cache space query
@@ -412,7 +417,11 @@ class MemoryController(nn.Module):
 
         # === Step 3: Gated fusion ===
         # Only incorporate context where read_gate is open
-        x_enhanced = x + read_gate * context
+        # Better fusion: Concatenate and project, then gate
+        # If gate is 0, we keep x. If gate is 1, we use the fused result.
+        combined = torch.cat([x, context], dim=-1)
+        fused = self.fusion_layer(combined)
+        x_enhanced = (1 - read_gate) * x + read_gate * fused
 
         return {
             'x_enhanced': x_enhanced,
@@ -436,6 +445,7 @@ class MemoryController(nn.Module):
         cache_layer_embed: Optional[nn.Embedding] = None,
         cache_iter_embed: Optional[nn.Embedding] = None,
         cache_pass_embed: Optional[nn.Embedding] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         WRITE Phase: Selectively update cache with output content.
@@ -454,6 +464,8 @@ class MemoryController(nn.Module):
 
             iteration_idx: Current iteration within layer (for temporal embedding)
             pass_idx: Current model-level pass (for temporal embedding)
+            mask: Optional mask [B, S, 1] or [B, S] - 1 for valid tokens, 0 for padding.
+                  If provided, forces write_gate to 0 for masked positions.
 
         Returns:
             Dict with:
@@ -503,6 +515,15 @@ class MemoryController(nn.Module):
             # STE: hard forward, soft backward
             hard_gate = (soft_decision > write_thresh).float()
             write_gate = hard_gate - soft_decision.detach() + soft_decision
+
+        # === Apply Mask (Prevent writing on padding) ===
+        if mask is not None:
+            # Ensure mask is [B, T, 1]
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(-1)
+            
+            # Force gate to 0 where mask is 0
+            write_gate = write_gate * mask
 
         # === Step 3: Slot Selection ===
         # Query for which slots to write to (match against content only)
@@ -559,12 +580,33 @@ class MemoryController(nn.Module):
         new_temporal = torch.cat([layer_emb, iter_emb, pass_emb], dim=-1)  # [1, D_temporal]
         new_temporal = new_temporal.unsqueeze(0).expand(B, K, -1)  # [B, K, D_temporal]
         
-        # === HARD EVICTION ===
-        # Slots that received writes get fully replaced with new content.
-        # Slots that didn't receive writes keep their old content unchanged.
-        final_content = has_writes * new_content + (1 - has_writes) * old_content
-        final_confidence = has_writes * new_confidence + (1 - has_writes) * old_confidence
-        final_temporal = has_writes * new_temporal + (1 - has_writes) * old_temporal
+        if self.soft_eviction:
+            # === SOFT UPDATE (Exponential Moving Average) ===
+            # Instead of hard eviction, we blend new content with old content.
+            # Update rate depends on how strongly the slot was targeted.
+            
+            # Calculate update strength per slot (0 to 1)
+            # slot_weights contains the sum of (write_gate * slot_prob * importance)
+            # We use tanh to map it to [0, 1] range smoothly
+            update_strength = torch.tanh(slot_weights.squeeze(-1)).unsqueeze(-1)  # [B, K, 1]
+            
+            # Blend content: New * alpha + Old * (1 - alpha)
+            final_content = update_strength * new_content + (1 - update_strength) * old_content
+            
+            # Blend confidence
+            final_confidence = update_strength * new_confidence + (1 - update_strength) * old_confidence
+            
+            # For temporal, we update if the update strength is significant (> 0.5)
+            is_significant = (update_strength > 0.5).float()
+            final_temporal = is_significant * new_temporal + (1 - is_significant) * old_temporal
+            
+        else:
+            # === HARD EVICTION ===
+            # Slots that received writes get fully replaced with new content.
+            # Slots that didn't receive writes keep their old content unchanged.
+            final_content = has_writes * new_content + (1 - has_writes) * old_content
+            final_confidence = has_writes * new_confidence + (1 - has_writes) * old_confidence
+            final_temporal = has_writes * new_temporal + (1 - has_writes) * old_temporal
         
         # Merge back into full cache format
         new_local_cache = self._merge_cache(final_content, final_confidence, final_temporal)
