@@ -166,14 +166,79 @@ class ConvBlock(nn.Module):
         return x + residual  # HIGH-D residual connection
 
 
+class CausalGlobalAverage(nn.Module):
+    """
+    Causal Global Averaging (CGA) with Sandglass Projections.
+    
+    Flow:
+    1. Project input to "summable space" via Sandglass MLP (d -> d/r -> d)
+    2. Compute causal average: avg = cumsum(v) / count
+    3. Project back to model space via Sandglass MLP (d -> d/r -> d)
+    4. Scale: return delta * alpha
+    
+    The Sandglass MLPs transform features into a space where averaging
+    is semantically meaningful, then transform the average back.
+    
+    No internal residuals - the output is a PURE DELTA to be added externally.
+    Alpha starts at 0 so the model begins training without CGA interference.
+    """
+    def __init__(self, d_model: int, reduction: int = 2, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        d_bottleneck = d_model // reduction
+        
+        # 1. Project to "summable space" via Sandglass MLP
+        # d_model -> d_bottleneck -> d_model
+        self.norm_in = nn.LayerNorm(d_model)
+        self.to_summable = nn.Sequential(
+            nn.Linear(d_model, d_bottleneck),
+            nn.GELU(),
+            nn.Linear(d_bottleneck, d_model),
+            nn.Dropout(dropout)
+        )
+        
+        # 2. Project averaged features back to delta via Sandglass MLP
+        # d_model -> d_bottleneck -> d_model
+        self.norm_out = nn.LayerNorm(d_model)
+        self.to_delta = nn.Sequential(
+            nn.Linear(d_model, d_bottleneck),
+            nn.GELU(),
+            nn.Linear(d_bottleneck, d_model),
+            nn.Dropout(dropout)
+        )
+        
+        # Learnable mixing coefficient
+        # Starts at 0 so CGA has NO effect initially.
+        # Model must actively learn to increase alpha if it helps.
+        self.alpha = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, S, D]
+        
+        # 1. Project to "summable space" with residual
+        # v = x + MLP(LN(x)) keeps original info + learned refinement
+        v = x + self.to_summable(self.norm_in(x))  # [B, S, D]
+        
+        # 2. Compute Running Mean (Causal)
+        v_sum = torch.cumsum(v, dim=1)
+        count = torch.arange(1, x.shape[1] + 1, device=x.device, dtype=x.dtype).view(1, -1, 1)
+        history_avg = v_sum / count  # [B, S, D]
+        
+        # 3. Project to delta (NO residual - pure transformation)
+        # This ensures output is a learned delta, not avg + delta
+        delta = self.to_delta(self.norm_out(history_avg))  # [B, S, D]
+        
+        # 4. Scale (starts at 0, grows if helpful)
+        return delta * self.alpha
+
+
 class DilatedConvStack(nn.Module):
     """
     Stack of dilated convolutions with exponentially increasing dilation.
+    PLUS a parallel Global Context branch.
 
     Dilations: [1, 2, 4, 8, ...] to capture multi-scale patterns.
-
-    This gives CNNs a larger receptive field without huge kernels.
-    With dilation [1,2,4,8] and kernel=3, receptive field = 2*(1+2+4+8) + 1 = 31
+    Global: Causal Average to capture infinite context (bridging padding gaps).
     """
 
     def __init__(
@@ -185,6 +250,15 @@ class DilatedConvStack(nn.Module):
     ):
         super().__init__()
 
+        # 1. The Global Context Branch (The "Backpack")
+        # Provides infinite memory persistence
+        #self.global_branch = CausalGlobalAverage(d_model, dropout=dropout)
+        self.global_branches = nn.ModuleList([
+            CausalGlobalAverage(d_model, dropout=dropout)
+            for _ in range(num_layers)
+        ])
+
+        # 2. The Local CNN Branch (The "Microscope")
         self.layers = nn.ModuleList([
             ConvBlock(
                 d_model=d_model,
@@ -195,15 +269,34 @@ class DilatedConvStack(nn.Module):
             for i in range(num_layers)
         ])
 
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: [B, S, D] input
         Returns:
-            [B, S, D] output with large receptive field
+            [B, S, D] output with large receptive field + global context
         """
-        for layer in self.layers:
-            x = layer(x)
+        # # 1. Get Global Context (Causal Global Averaging)
+        # x_global = self.global_branch(x)
+        
+        # # 2. Inject Context BEFORE the CNNs (Pre-Injection)
+        # # This allows CNN kernels to 'see' the global context and modulate processing.
+        # # Since ConvBlocks have residuals, this signal is also carried forward.
+        # x = x + x_global
+        
+        # # 3. Apply Local CNN Stack
+        # for layer in self.layers:
+        #     x = layer(x)
+            
+        # return x
+        for layer_idx, layer in enumerate(self.layers):
+            # Read the DEDICATED CGA for this layer
+            x_global = self.global_branches[layer_idx](x) 
+            
+            x = x + x_global # Inject context
+            x = layer(x)     # Compute CNN
+            
         return x
 
 
@@ -267,7 +360,7 @@ class CNNCacheLayer(nn.Module):
             layer_idx=layer_idx,
             dropout=dropout,
             use_fixed_threshold=True,
-            fixed_threshold=0.5,
+            fixed_threshold=0.3,  # Lower threshold to encourage writes
         )
 
         # CNN compute (dilated stack for large receptive field)

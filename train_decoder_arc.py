@@ -383,7 +383,7 @@ def compute_decoder_loss(
     
     Components:
     1. Task loss: Cross-entropy on valid positions only
-    2. Gate usage loss: Encourage gates to be active
+    2. Gate usage loss: Encourage gates to stay near target values (prevent collapse)
     """
     # === 1. TASK LOSS ===
     B, S, V = logits.shape
@@ -392,44 +392,36 @@ def compute_decoder_loss(
     
     task_loss = F.cross_entropy(flat_logits, flat_targets, ignore_index=IGNORE_LABEL)
     
-    # === 2. GATE POLARIZATION LOSS ===
-    # Encourage gates to be close to 0 or 1 (binary decision making)
-    # Loss = mean(gate * (1 - gate))
-    # This is minimized when gate is 0 or 1, maximized at 0.5
+    # === 2. GATE TARGET LOSS ===
+    # Encourage gates to stay near target values to prevent collapse
+    # read_target ~0.4: model should read from cache moderately
+    # write_target ~0.3: model should write selectively but not rarely
     gate_loss = torch.tensor(0.0, device=device)
     avg_read = torch.tensor(0.0, device=device)
     avg_write = torch.tensor(0.0, device=device)
+    
+    read_target = 0.4
+    write_target = 0.3
     
     read_gates = aux.get('read_gates', [])
     write_gates = aux.get('write_gates', [])
     
     if read_gates:
-        # Calculate averages for logging
+        # Calculate averages
         avg_read = torch.stack([g.mean() for g in read_gates]).mean()
         avg_write = torch.stack([g.mean() for g in write_gates]).mean() if write_gates else torch.tensor(0.0, device=device)
         
-        # Polarization loss
-        # Use soft gates if available for better gradients
-        # But aux usually contains the hard/ste gates used in forward
-        # We can use the gates directly since they have gradients (STE)
+        # Target gate loss: penalize deviation from target
+        # Use squared error so small deviations are tolerated
+        read_loss = (avg_read - read_target) ** 2
+        write_loss = (avg_write - write_target) ** 2 if write_gates else torch.tensor(0.0, device=device)
         
-        # Collect all gates
-        all_gates = []
-        if read_gates:
-            all_gates.extend([g.reshape(-1) for g in read_gates])
-        if write_gates:
-            all_gates.extend([g.reshape(-1) for g in write_gates])
-            
-        if all_gates:
-            all_gates_flat = torch.cat(all_gates)
-            # Polarization: minimize g * (1-g) -> pushes g to 0 or 1
-            # Scale by 4 so max loss is 1.0 (at g=0.5)
-            gate_loss = 4.0 * (all_gates_flat * (1.0 - all_gates_flat)).mean()
+        gate_loss = read_loss + write_loss
         
     # === 3. TOTAL LOSS ===
-    # Weight gate loss small so it doesn't overpower task loss
-    # We want the model to solve the task first, then optimize memory usage
-    total_loss = task_loss + 0.01 * gate_loss
+    # Weight gate loss to be meaningful but not dominant
+    # 0.1 weight means ~10% of gradient comes from gate regularization
+    total_loss = task_loss + 0.1 * gate_loss
     
     metrics = {
         'loss_total': total_loss.detach().item(),
@@ -897,10 +889,10 @@ def main():
     
     # Learning rate scheduler (cosine annealing per epoch)
     # Note: step() is called once per epoch, so T_max = num_epochs
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=num_epochs, eta_min=lr * 0.01  # Decay to 1% of initial LR
-    )
-    print(f"Using cosine LR schedule (T_max={num_epochs} epochs, min_lr={lr*0.01:.2e})")
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    #     optimizer, T_max=num_epochs, eta_min=lr * 0.01  # Decay to 1% of initial LR
+    # )
+    #print(f"Using cosine LR schedule (T_max={num_epochs} epochs, min_lr={lr*0.01:.2e})")
     
     # Logging
     log_dir = Path("logs") / f"decoder_arc_{preset_name}_{time.strftime('%Y%m%d_%H%M%S')}"
@@ -931,8 +923,8 @@ def main():
         )
         
         # Step scheduler
-        scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
+        # scheduler.step()
+        # current_lr = scheduler.get_last_lr()[0]
         
         logger.log_epoch(epoch, train_loss, train_cell_acc, train_task_acc)
         
@@ -964,12 +956,12 @@ def main():
                             eval_cell_acc=eval_cell_acc, eval_task_acc=eval_task_acc)
             
             print(f"Epoch {epoch+1:3d}/{num_epochs} | Loss: {train_loss:.4f} | "
-                  f"Eval Task: {eval_task_acc:.3f} | Eval Cell: {eval_cell_acc:.3f} | "
-                  f"Best: {best_task_acc:.3f} | τ: {temperature:.2f} | lr: {current_lr:.2e}")
+                  f"Eval Task: {eval_task_acc:.3f} | Eval Cell: {eval_cell_acc:.3f} | ")
+                  #f"Best: {best_task_acc:.3f} | τ: {temperature:.2f} | lr: {current_lr:.2e}")
         else:
             print(f"Epoch {epoch+1:3d}/{num_epochs} | Loss: {train_loss:.4f} | "
-                  f"Train Task: {train_task_acc:.3f} | Train Cell: {train_cell_acc:.3f} | "
-                   f"τ: {temperature:.2f} | lr: {current_lr:.2e}")
+                  f"Train Task: {train_task_acc:.3f} | Train Cell: {train_cell_acc:.3f} | ")
+                   #f"τ: {temperature:.2f} | lr: {current_lr:.2e}")
         
         # Checkpoint every 20 epochs
         if (epoch + 1) % 20 == 0:
@@ -977,7 +969,7 @@ def main():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
+                #'scheduler_state_dict': scheduler.state_dict(),
             }, log_dir / f"checkpoint_epoch{epoch+1}.pt")
     
     # Final evaluation with autoregressive generation

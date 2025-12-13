@@ -237,6 +237,11 @@ class MemoryController(nn.Module):
                     nn.init.ones_(m.weight)
                     nn.init.zeros_(m.bias)
         
+        # Bias write_decision to start positive (encourage writes early)
+        # sigmoid(0.5) ≈ 0.62, so writes will start above the 0.3 threshold
+        if self.write_decision[-1].bias is not None:
+            nn.init.constant_(self.write_decision[-1].bias, 0.5)
+        
         # Bias threshold networks to start near 0.5
         # This gives neutral initial behavior
         if self.write_threshold[-2].bias is not None:
