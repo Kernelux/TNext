@@ -96,7 +96,7 @@ import math
 from typing import Optional, Dict, Tuple
 
 from .utils import gumbel_softmax
-from .config import FeatureFlags
+from .config import FeatureFlags, SLOT_DIMS
 
 
 # ============================================================================
@@ -830,41 +830,62 @@ class CacheSelfAttention(nn.Module):
     def __init__(
         self, 
         d_cache: int, 
+        num_slots: int,
         num_heads: int = 4, 
         dropout: float = 0.1, 
         use_linear: bool = True
     ):
         super().__init__()
         self.d_cache = d_cache
+        self.num_slots = num_slots
         self.num_heads = num_heads
         self.use_linear = use_linear
         
+        # Learnable positional embedding for slots
+        self.pos_embed = nn.Parameter(torch.randn(1, num_slots, d_cache) * 0.02)
+        
         if use_linear:
             self.attn = LinearAttention(d_cache, num_heads, dropout)
+            # Standard attention for masked operation (linear attention doesn't support masks)
+            self.masked_attn = nn.MultiheadAttention(
+                d_cache, num_heads, dropout=dropout, batch_first=True
+            )
         else:
             self.attn = nn.MultiheadAttention(
                 d_cache, num_heads, dropout=dropout, batch_first=True
             )
-        
-        # Standard attention for masked operation (linear attention doesn't support masks)
-        self.masked_attn = nn.MultiheadAttention(
-            d_cache, num_heads, dropout=dropout, batch_first=True
+            self.masked_attn = None
+            
+        # Consolidation MLP (Feed-Forward Network)
+        self.norm1 = nn.LayerNorm(d_cache)
+        self.norm2 = nn.LayerNorm(d_cache)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_cache, d_cache * 4),
+            nn.GELU(),
+            nn.Linear(d_cache * 4, d_cache),
+            nn.Dropout(dropout)
         )
-        
-        self.norm = nn.LayerNorm(d_cache)
         
         # Initialize weights
         self._init_weights()
     
     def _init_weights(self):
         """Initialize CacheSelfAttention weights."""
-        from .utils import init_layer_norm
-        
-        # LayerNorm
-        init_layer_norm(self.norm)
-        
         # Note: LinearAttention and nn.MultiheadAttention handle their own init
         # nn.MultiheadAttention uses xavier_uniform_ by default
+        
+        # Init MLP
+        for m in self.mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        # Init Norms
+        nn.init.ones_(self.norm1.weight)
+        nn.init.zeros_(self.norm1.bias)
+        nn.init.ones_(self.norm2.weight)
+        nn.init.zeros_(self.norm2.bias)
         
     def forward(
         self, 
@@ -882,16 +903,215 @@ class CacheSelfAttention(nn.Module):
         Returns:
             Updated cache with inter-slot information flow
         """
+        # Add positional embedding
+        x = cache + self.pos_embed
+        
+        # Pre-LN Attention Block
+        residual = x
+        x = self.norm1(x)
+        
         if attn_mask is not None:
             # Use standard attention when masking is required
             # Convert bool mask to float: True (blocked) → -inf
             float_mask = attn_mask.float().masked_fill(attn_mask, float('-inf'))
-            attn_out, _ = self.masked_attn(cache, cache, cache, attn_mask=float_mask)
+            
+            if self.use_linear:
+                attn_out, _ = self.masked_attn(x, x, x, attn_mask=float_mask)
+            else:
+                attn_out, _ = self.attn(x, x, x, attn_mask=float_mask)
         elif self.use_linear:
-            attn_out, _ = self.attn(cache, cache, cache)
+            attn_out, _ = self.attn(x, x, x)
         else:
-            attn_out, _ = self.attn(cache, cache, cache)
+            attn_out, _ = self.attn(x, x, x)
+            
+        x = residual + attn_out
         
-        # Residual connection without LayerNorm - AdamAtan2 handles gradient magnitude
-        # and this preserves cache magnitude information for slot diversity
-        return cache + attn_out
+        # Pre-LN MLP Block (Consolidation)
+        residual = x
+        x = self.norm2(x)
+        x = self.mlp(x)
+        x = residual + x
+        
+        return x
+
+
+class UnifiedMemoryConsolidator(nn.Module):
+    """
+    Unified Workspace Consolidation for LTM and WM.
+    
+    Concatenates LTM and WM slots into a single workspace, runs self-attention,
+    and then splits them back. This allows:
+    1. LTM to attend to WM (absorb new patterns from working memory)
+    2. WM to attend to LTM (retrieve global rules/patterns)
+    3. LTM/WM to self-consolidate
+    
+    Called ONCE per chunk/step at the model level (after all layers process).
+    Handles heterogeneous slot dimensions by projecting to a common dimension.
+    """
+    
+    def __init__(
+        self,
+        d_cache: int,
+        d_model: int,  # Common dimension for attention
+        num_ltm_slots: int,
+        num_wm_slots: int,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.d_cache = d_cache
+        self.d_model = d_model
+        self.num_ltm_slots = num_ltm_slots
+        self.num_wm_slots = num_wm_slots
+        
+        # Slot dimensions - both LTM and WM now have same structure:
+        # [content (d_cache) | validity (1) | temporal (d_temporal)]
+        self.d_ltm_slot = SLOT_DIMS.d_slot(d_cache)
+        self.d_wm_slot = SLOT_DIMS.d_slot(d_cache)  # Now aligned with LTM
+        
+        # Projections to common dimension
+        self.ltm_proj = nn.Linear(self.d_ltm_slot, d_model)
+        self.wm_proj = nn.Linear(self.d_wm_slot, d_model)
+        
+        # Projections back to slot dimensions (residual update)
+        self.ltm_out = nn.Linear(d_model, self.d_ltm_slot)
+        self.wm_out = nn.Linear(d_model, self.d_wm_slot)
+        
+        # Linear Attention over unified workspace (O(n) instead of O(n²))
+        self.attn = LinearAttention(d_model, num_heads, dropout)
+        
+        # Consolidation MLP
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout)
+        )
+        
+        # Positional embeddings for slot types
+        # Using Sinusoidal Embeddings for slot positions
+        total_slots = num_ltm_slots + num_wm_slots
+        self.pos_embed = SinusoidalPositionalEmbedding(d_model, max_len=total_slots)
+        
+        self._init_weights()
+        
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.ltm_proj.weight)
+        nn.init.zeros_(self.ltm_proj.bias)
+        nn.init.xavier_uniform_(self.wm_proj.weight)
+        nn.init.zeros_(self.wm_proj.bias)
+        nn.init.xavier_uniform_(self.ltm_out.weight)
+        nn.init.zeros_(self.ltm_out.bias)
+        nn.init.xavier_uniform_(self.wm_out.weight)
+        nn.init.zeros_(self.wm_out.bias)
+        
+        # Init MLP
+        for m in self.mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        nn.init.ones_(self.norm1.weight)
+        nn.init.zeros_(self.norm1.bias)
+        nn.init.ones_(self.norm2.weight)
+        nn.init.zeros_(self.norm2.bias)
+
+    def forward(
+        self,
+        cache: torch.Tensor,  # [B, N_ltm, D_ltm]
+        wm: torch.Tensor,     # [B, N_wm, D_wm]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Cross-consolidate LTM and WM in a unified workspace.
+        
+        Args:
+            cache: [B, N_ltm, D_ltm_slot] - LTM cache
+            wm: [B, N_wm, D_wm_slot] - Working memory (content + freshness)
+            
+        Returns:
+            updated_cache: [B, N_ltm, D_ltm_slot]
+            updated_wm: [B, N_wm, D_wm_slot]
+        """
+        B = cache.shape[0]
+        N_ltm = cache.shape[1]
+        N_wm = wm.shape[1]
+        
+        # 1. Project to common dimension
+        h_ltm = self.ltm_proj(cache)  # [B, N_ltm, D_model]
+        h_wm = self.wm_proj(wm)       # [B, N_wm, D_model]
+        
+        # 2. Concatenate into unified workspace
+        h = torch.cat([h_ltm, h_wm], dim=1)  # [B, N_ltm + N_wm, D_model]
+        
+        # Add positional embeddings
+        # Create indices for slots [0, 1, ..., N-1]
+        slot_indices = torch.arange(h.shape[1], device=h.device)
+        h = h + self.pos_embed(slot_indices).unsqueeze(0)
+        
+        # 3. Self-Attention (Pre-LN) with Linear Attention (O(n) complexity)
+        residual = h
+        h = self.norm1(h)
+        attn_out, _ = self.attn(h, h, h)
+        h = residual + attn_out
+        
+        # 4. MLP (Pre-LN)
+        residual = h
+        h = self.norm2(h)
+        h = self.mlp(h)
+        h = residual + h
+        
+        # 5. Split back
+        h_ltm_new = h[:, :N_ltm, :]
+        h_wm_new = h[:, N_ltm:, :]
+        
+        # 6. Project back and apply as residual update
+        # IMPORTANT: Only update CONTENT, preserve metadata managed by read/write ops
+        delta_ltm = self.ltm_out(h_ltm_new)
+        delta_wm = self.wm_out(h_wm_new)
+        
+        # LTM slot: [content (d_cache), confidence (1), temporal (d_temporal)]
+        # Only update content portion
+        ltm_content = cache[..., :self.d_cache] + delta_ltm[..., :self.d_cache]
+        ltm_meta = cache[..., self.d_cache:]  # Preserve confidence + temporal
+        updated_cache = torch.cat([ltm_content, ltm_meta], dim=-1)
+        
+        # WM slot: [content (d_cache), validity (1), temporal (d_temporal)]
+        # Now aligned with LTM structure - only update content
+        wm_content = wm[..., :self.d_cache] + delta_wm[..., :self.d_cache]  # Update content only
+        wm_meta = wm[..., self.d_cache:]  # Preserve validity + temporal
+        updated_wm = torch.cat([wm_content, wm_meta], dim=-1)
+        
+        return updated_cache, updated_wm
+
+
+class SinusoidalPositionalEmbedding(nn.Module):
+    """
+    Sinusoidal Positional Embedding (standard Transformer style).
+    
+    PE(pos, 2i) = sin(pos / 10000^(2i/d_model))
+    PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+    """
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+        self.d_model = d_model
+        
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, S] or [S] tensor of position indices
+        Returns:
+            [B, S, D] or [S, D] embeddings
+        """
+        return F.embedding(x, self.pe)

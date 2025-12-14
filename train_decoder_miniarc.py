@@ -8,7 +8,7 @@ Single forward pass (no refinement) — efficient like modern LLMs.
 Key Features:
 - Fully causal processing (autoregressive)
 - Teacher forcing during training
-- Cache provides global memory beyond CNN receptive field
+- LTM (Long-Term Memory) + WM (Working Memory) dual memory system
 - Simple loss: CE on generation tokens + gate regularization
 
 Usage:
@@ -18,6 +18,7 @@ Presets:
     debug   - Minimal for testing
     fast    - Quick training (laptop-friendly)
     medium  - Balanced performance
+    fast_full - Same config as ARC-AGI-2 training
     full    - Best performance
 """
 
@@ -28,6 +29,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import os
 import time
+import argparse
 import numpy as np
 from pathlib import Path
 from typing import Tuple, Optional, Dict
@@ -103,14 +105,23 @@ def visualize_sample(
     lines.append(f"[Step {step}] Decoder+Cache Mini-ARC Sample #{sample_idx}")
     
     if aux:
-        read_gates = aux.get('read_gates', [])
-        write_gates = aux.get('write_gates', [])
-        if read_gates:
-            avg_read = sum(g.mean().item() for g in read_gates) / len(read_gates)
-            lines.append(f"  Avg Read Gate: {avg_read:.3f}")
-        if write_gates:
-            avg_write = sum(g.mean().item() for g in write_gates) / len(write_gates)
-            lines.append(f"  Avg Write Gate: {avg_write:.3f}")
+        ltm_read = aux.get('ltm_read_gates', [])
+        ltm_write = aux.get('ltm_write_gates', [])
+        wm_read = aux.get('wm_read_gates', [])
+        wm_write = aux.get('wm_write_gates', [])
+        
+        if ltm_read:
+            avg_read = sum(g.detach().mean().item() for g in ltm_read) / len(ltm_read)
+            lines.append(f"  Avg LTM Read: {avg_read:.3f}")
+        if ltm_write:
+            avg_write = sum(g.detach().mean().item() for g in ltm_write) / len(ltm_write)
+            lines.append(f"  Avg LTM Write: {avg_write:.3f}")
+        if wm_read:
+            avg_read = sum(g.detach().mean().item() for g in wm_read) / len(wm_read)
+            lines.append(f"  Avg WM Read: {avg_read:.3f}")
+        if wm_write:
+            avg_write = sum(g.detach().mean().item() for g in wm_write) / len(wm_write)
+            lines.append(f"  Avg WM Write: {avg_write:.3f}")
     
     lines.append(f"{'='*60}")
     
@@ -163,7 +174,7 @@ def visualize_sample(
 
 
 # ============================================================================
-# Loss Computation
+# Loss Computation (same as train_decoder_arc.py)
 # ============================================================================
 
 IGNORE_LABEL = -100
@@ -176,11 +187,11 @@ def compute_decoder_loss(
     device: torch.device,
 ) -> Tuple[torch.Tensor, Dict]:
     """
-    Simple loss for decoder model.
+    Loss for decoder model on ARC.
     
     Components:
-    1. Task loss: Cross-entropy on generation tokens only
-    2. Gate usage loss: Encourage gates to be active (prevent dead cache)
+    1. Task loss: Cross-entropy on valid positions only
+    2. Gate usage loss: Encourage gates to stay near target values (prevent collapse)
     """
     # === 1. TASK LOSS ===
     B, S, V = logits.shape
@@ -189,33 +200,36 @@ def compute_decoder_loss(
     
     task_loss = F.cross_entropy(flat_logits, flat_targets, ignore_index=IGNORE_LABEL)
     
-    # === 2. GATE USAGE LOSS ===
+    # === 2. GATE TARGET LOSS ===
+    # Encourage gates to stay near target values to prevent collapse
     gate_loss = torch.tensor(0.0, device=device)
     avg_read = torch.tensor(0.0, device=device)
     avg_write = torch.tensor(0.0, device=device)
     
-    read_gates = aux.get('read_gates', [])
-    write_gates = aux.get('write_gates', [])
+    read_target = 0.4
+    write_target = 0.3
+    
+    # Use LTM gates for regularization
+    read_gates = aux.get('ltm_read_gates', [])
+    write_gates = aux.get('ltm_write_gates', [])
     
     if read_gates:
         avg_read = torch.stack([g.mean() for g in read_gates]).mean()
         avg_write = torch.stack([g.mean() for g in write_gates]).mean() if write_gates else torch.tensor(0.0, device=device)
         
-        # Encourage gates to be around 0.4
-        target_gate = 0.4
-        read_gate_loss = (avg_read - target_gate).abs()
-        write_gate_loss = (avg_write - target_gate).abs()
+        # Target gate loss: squared error
+        read_loss = (avg_read - read_target) ** 2
+        write_loss = (avg_write - write_target) ** 2 if write_gates else torch.tensor(0.0, device=device)
         
-        gate_loss = 0.1 * (read_gate_loss + write_gate_loss)
-    
+        gate_loss = read_loss + write_loss
+        
     # === 3. TOTAL LOSS ===
-    total_loss = task_loss + gate_loss
+    total_loss = task_loss + 0.1 * gate_loss
     
-    # Metrics (detach before .item() to avoid warning)
     metrics = {
         'loss_total': total_loss.detach().item(),
         'loss_task': task_loss.detach().item(),
-        'loss_gate': gate_loss.detach().item() if isinstance(gate_loss, torch.Tensor) else gate_loss,
+        'loss_gate': gate_loss.detach().item(),
         'avg_read_gate': avg_read.detach().item() if read_gates else 0.0,
         'avg_write_gate': avg_write.detach().item() if (read_gates and write_gates) else 0.0,
     }
@@ -224,7 +238,7 @@ def compute_decoder_loss(
 
 
 # ============================================================================
-# Training Loop
+# Training Loop (with gradient accumulation like train_decoder_arc.py)
 # ============================================================================
 
 def train_epoch(
@@ -236,14 +250,19 @@ def train_epoch(
     logger: Optional[MetricsLogger] = None,
     log_interval: int = 10,
     temperature: float = 1.0,
+    grad_accum_steps: int = 1,
+    visualize_interval: int = 50,
 ) -> Tuple[float, float, float, int]:
-    """Training epoch with teacher forcing."""
+    """Training epoch with teacher forcing and gradient accumulation."""
     model.train()
     total_loss = 0
     correct_cells = 0
     total_cells = 0
     correct_tasks = 0
     total_tasks = 0
+    accum_loss = 0
+    
+    optimizer.zero_grad()
     
     pbar = tqdm(dataloader, desc="Train", leave=False)
     for batch_idx, batch in enumerate(pbar):
@@ -251,8 +270,6 @@ def train_epoch(
         demo_outputs = batch["demo_outputs"].to(device)
         test_input = batch["test_input"].to(device)
         test_output = batch["test_output"].to(device)
-        
-        optimizer.zero_grad()
         
         # Forward with teacher forcing
         logits, cache, aux = model(
@@ -262,27 +279,32 @@ def train_epoch(
             return_aux=True,
         )
         
-        # Loss
+        # Loss (scaled for accumulation)
         loss, metrics = compute_decoder_loss(logits, test_output, aux, device)
+        loss = loss / grad_accum_steps
         
         # Backward
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        accum_loss += loss.detach().item()
         
-        # Check for NaN
-        has_nan = any(
-            p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any())
-            for p in model.parameters()
-        )
-        if has_nan:
-            print(f"[Step {global_step}] Skipping due to NaN/Inf gradients")
-            optimizer.zero_grad()
-        else:
-            optimizer.step()
-        
-        loss_val = loss.detach().item()
-        total_loss += loss_val
-        global_step += 1
+        # Optimizer step after accumulation
+        if (batch_idx + 1) % grad_accum_steps == 0:
+            # Check for NaN
+            has_nan = any(
+                p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any())
+                for p in model.parameters()
+            )
+            if has_nan:
+                print(f"[Step {global_step}] Skipping due to NaN/Inf gradients")
+                optimizer.zero_grad()
+                accum_loss = 0
+            else:
+                optimizer.step()
+                optimizer.zero_grad()
+            
+            total_loss += accum_loss * grad_accum_steps
+            accum_loss = 0
+            global_step += 1
         
         # Metrics
         preds = logits.detach().argmax(dim=-1)
@@ -298,27 +320,34 @@ def train_epoch(
         cell_acc = correct_cells / max(total_cells, 1)
         task_acc = correct_tasks / max(total_tasks, 1)
         
-        # Logging - convert gate tensors to format expected by logger
+        # Logging
         if logger is not None and batch_idx % log_interval == 0:
-            # Aggregate gate stats for logging
-            read_gates = aux.get('read_gates', [])
-            write_gates = aux.get('write_gates', [])
+            ltm_read_gates = aux.get('ltm_read_gates', [])
+            ltm_write_gates = aux.get('ltm_write_gates', [])
+            wm_read_gates = aux.get('wm_read_gates', [])
+            wm_write_gates = aux.get('wm_write_gates', [])
+            wm_validity = aux.get('wm_validity', [])
             
-            log_aux = {
-                'passes_run': 1,  # Single pass (decoder-only)
-            }
+            log_aux = {'passes_run': 1}
             
-            if read_gates:
-                read_sum = sum(g.sum().item() for g in read_gates)
-                read_count = sum(g.numel() for g in read_gates)
-                log_aux['read_gate_sum'] = read_sum
-                log_aux['read_gate_count'] = read_count
+            def get_gate_rate(gates):
+                if not gates: return 0.0
+                total_mean = sum(g.detach().mean().item() for g in gates) / len(gates)
+                return total_mean * 100
             
-            if write_gates:
-                write_sum = sum(g.sum().item() for g in write_gates)
-                write_count = sum(g.numel() for g in write_gates)
-                log_aux['write_gate_sum'] = write_sum
-                log_aux['write_gate_count'] = write_count
+            if ltm_read_gates:
+                log_aux['ltm_read_rate'] = get_gate_rate(ltm_read_gates)
+            if ltm_write_gates:
+                log_aux['ltm_write_rate'] = get_gate_rate(ltm_write_gates)
+            if wm_read_gates:
+                log_aux['wm_read_rate'] = get_gate_rate(wm_read_gates)
+            if wm_write_gates:
+                log_aux['wm_write_rate'] = get_gate_rate(wm_write_gates)
+            
+            if wm_validity:
+                all_valid = torch.cat([v.flatten() for v in wm_validity])
+                pct_occupied = all_valid.mean().item() * 100
+                log_aux['wm_slots_occupied_pct'] = pct_occupied
             
             logger.log_step(
                 step=global_step,
@@ -330,7 +359,7 @@ def train_epoch(
             )
         
         # Visualization
-        if global_step % 50 == 0:
+        if global_step % visualize_interval == 0 and global_step > 0:
             viz_str = visualize_sample(
                 demo_inputs=demo_inputs[0],
                 demo_outputs=demo_outputs[0],
@@ -345,7 +374,7 @@ def train_epoch(
         
         # Progress bar
         pbar.set_postfix({
-            'loss': f'{loss_val:.3f}',
+            'loss': f'{metrics["loss_total"]:.3f}',
             'cell': f'{cell_acc:.3f}',
             'task': f'{task_acc:.3f}',
         })
@@ -357,13 +386,20 @@ def train_epoch(
                 aux[key].clear()
         aux.clear()
         
-        if batch_idx % 20 == 0:
+        if batch_idx % 50 == 0:
             if device.type == 'mps':
                 torch.mps.empty_cache()
             elif device.type == 'cuda':
                 torch.cuda.empty_cache()
     
-    return total_loss / len(dataloader), cell_acc, task_acc, global_step
+    # Handle remaining gradients
+    if (len(dataloader) % grad_accum_steps) != 0:
+        optimizer.step()
+        optimizer.zero_grad()
+        total_loss += accum_loss * grad_accum_steps
+        global_step += 1
+    
+    return total_loss / max(len(dataloader) // grad_accum_steps, 1), cell_acc, task_acc, global_step
 
 
 @torch.no_grad()
@@ -374,6 +410,7 @@ def evaluate(
     global_step: int = 0,
     visualize_samples: int = 3,
     use_generation: bool = False,
+    logger: Optional[MetricsLogger] = None,
 ) -> Tuple[float, float]:
     """
     Evaluation.
@@ -403,6 +440,7 @@ def evaluate(
                 max_len=test_output.shape[1],
                 temperature=0.0,  # Greedy
             )
+            aux = None
         else:
             # Teacher forcing (faster)
             logits, _, aux = model(
@@ -434,7 +472,7 @@ def evaluate(
                         prediction=preds[i],
                         sample_idx=samples_visualized,
                         step=global_step,
-                        aux=aux if not use_generation else None,
+                        aux=aux,
                     )
                     print(viz_str)
                     samples_visualized += 1
@@ -450,14 +488,13 @@ def evaluate(
 
 def print_model_summary(model: torch.nn.Module):
     """Print model parameter summary."""
-    print("\n" + "="*60)
+    print("\n" + "="*70)
     print(f"Model: {model.__class__.__name__}")
-    print("="*60)
+    print("="*70)
     
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
-    # Count by component
     embed_params = sum(p.numel() for n, p in model.named_parameters() if 'embed' in n)
     conv_params = sum(p.numel() for n, p in model.named_parameters() if 'conv' in n)
     memory_params = sum(p.numel() for n, p in model.named_parameters() if 'memory' in n)
@@ -467,7 +504,7 @@ def print_model_summary(model: torch.nn.Module):
     print(f"  - Embeddings:       {embed_params:,}")
     print(f"  - Convolutions:     {conv_params:,}")
     print(f"  - Memory/Cache:     {memory_params:,}")
-    print("="*60 + "\n")
+    print("="*70 + "\n")
 
 
 # ============================================================================
@@ -475,7 +512,11 @@ def print_model_summary(model: torch.nn.Module):
 # ============================================================================
 
 def main():
-    import sys
+    parser = argparse.ArgumentParser(description="Train Decoder+Cache on Mini-ARC")
+    parser.add_argument("preset", nargs="?", default="fast", help="debug|fast|medium|fast_full|full")
+    parser.add_argument("--ltm-wta", action="store_true", help="Use winner-take-all for LTM write collisions")
+    parser.add_argument("--wm-blend", action="store_true", help="Use blended writes for WM collisions")
+    args = parser.parse_args()
     
     # Download Mini-ARC
     data_path = download_miniarc("./Mini-ARC")
@@ -488,46 +529,66 @@ def main():
     print(f"Using device: {device}")
     
     # Preset
-    preset_name = sys.argv[1] if len(sys.argv) > 1 else "fast"
-    print(f"\nUsing preset: '{preset_name}'")
+    preset_name = args.preset
+    ltm_wta_write = 'WTA'
+    wm_wta_write = 'WTA'
     
-    # Model configuration per preset (laptop-friendly defaults)
-    lr = 5e-4
+    print(f"\nUsing preset: '{preset_name}'")
+    print(f"LTM write collision: {'WTA' if ltm_wta_write else 'blend'}")
+    print(f"WM write collision: {'WTA' if wm_wta_write else 'blend'}")
+    
+    # Model configuration per preset (matching train_decoder_arc.py style)
+    lr = 3e-4
+    grad_accum_steps = 1
+    soft_eviction = False
+    num_working_memory_slots = 16
     
     if preset_name == "debug":
-        d_model, d_cache = 32, 24
+        d_model, d_cache = 32, 16
         num_layers, num_slots = 2, 8
+        num_working_memory_slots = 8
         kernel_size, num_conv_layers = 3, 1
         batch_size = 8
         num_epochs = 10
+        grad_accum_steps = 1
     elif preset_name == "fast":
-        d_model, d_cache = 64, 48
-        num_layers, num_slots = 3, 16
+        d_model, d_cache = 64, 32
+        num_layers, num_slots = 4, 16
+        num_working_memory_slots = 16
         kernel_size, num_conv_layers = 5, 2
         batch_size = 16
         num_epochs = 50
+        lr = 2e-4
+        grad_accum_steps = 1
     elif preset_name == "medium":
-        d_model, d_cache = 96, 64
-        num_layers, num_slots = 4, 24
+        d_model, d_cache = 96, 48
+        num_layers, num_slots = 6, 24
+        num_working_memory_slots = 24
         kernel_size, num_conv_layers = 5, 2
         batch_size = 8
         num_epochs = 100
-        lr = 3e-4
+        lr = 1e-4
+        grad_accum_steps = 2
     elif preset_name == "fast_full":
-        # Larger model, quick epochs
-        d_model, d_cache = 128, 64
-        num_layers, num_slots = 6, 32
-        kernel_size, num_conv_layers = 5, 3
-        batch_size = 4
+        # Same config as train_decoder_arc.py fast_full
+        d_model, d_cache = 32, 16
+        num_layers, num_slots = 8, 32
+        num_working_memory_slots = 32
+        kernel_size, num_conv_layers = 3, 5
+        batch_size = 8
         num_epochs = 100
-        lr = 2e-4
+        lr = 1e-3
+        grad_accum_steps = 2
+        soft_eviction = False
     else:  # full
         d_model, d_cache = 128, 64
-        num_layers, num_slots = 6, 32
+        num_layers, num_slots = 8, 48
+        num_working_memory_slots = 48
         kernel_size, num_conv_layers = 5, 3
         batch_size = 4
-        num_epochs = 100
-        lr = 2e-4
+        num_epochs = 200
+        lr = 5e-5
+        grad_accum_steps = 4
     
     # Dataset
     dataset = MiniARCDataset(str(data_path), augment=True)
@@ -539,30 +600,51 @@ def main():
         generator=torch.Generator().manual_seed(42)
     )
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=0,
+        pin_memory=True if device.type == 'cuda' else False,
+    )
+    eval_loader = DataLoader(
+        eval_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=0,
+    )
     
     print(f"\nTrain samples: {len(train_dataset)}, Eval samples: {len(eval_dataset)}")
-    print(f"Config: d_model={d_model}, d_cache={d_cache}")
-    print(f"        {num_layers} layers × {num_slots} slots")
+    print(f"Sequence length: {MAX_SEQ_LEN} (5x5 grids)")
+    print(f"\nConfig: d_model={d_model}, d_cache={d_cache}")
+    print(f"        {num_layers} layers × {num_slots} LTM slots × {num_working_memory_slots} WM slots")
     print(f"        kernel={kernel_size}, conv_layers={num_conv_layers}")
+    print(f"        batch_size={batch_size}, grad_accum={grad_accum_steps}")
+    print(f"        effective_batch={batch_size * grad_accum_steps}")
     
-    # Model
+    # Model - Mini-ARC uses smaller sequences
+    # Format: [demo_in_1, demo_out_1, ..., demo_in_N, demo_out_N, test_in, test_out]
+    num_demos = 3
+    actual_max_seq_len = (2 * num_demos + 2) * MAX_SEQ_LEN  # 8 * 25 = 200
+    
     model = DecoderCacheModel(
         vocab_size=VOCAB_SIZE,
         d_model=d_model,
         d_cache=d_cache,
         num_layers=num_layers,
-        num_slots=num_slots,
+        num_slots=num_slots,  # LTM slots
         kernel_size=kernel_size,
         num_conv_layers_per_block=num_conv_layers,
-        max_seq_len=256,
-        dropout=0.0,
+        max_seq_len=actual_max_seq_len,
+        soft_eviction=soft_eviction,
+        ltm_wta_write=ltm_wta_write,
+        wm_wta_write=wm_wta_write,
+        num_wm_slots=num_working_memory_slots,
     ).to(device)
     
     print_model_summary(model)
     
-    # Optimizer
+    # Optimizer (same as train_decoder_arc.py)
     optimizer = AdamAtan2(
         model.parameters(),
         lr=lr,
@@ -571,7 +653,7 @@ def main():
     print(f"Using AdamAtan2 optimizer (lr={lr})")
     
     # Logging
-    log_dir = Path("logs") / f"decoder_cache_{preset_name}_{time.strftime('%Y%m%d_%H%M%S')}"
+    log_dir = Path("logs") / f"decoder_miniarc_{preset_name}_{time.strftime('%Y%m%d_%H%M%S')}"
     log_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir)
     logger = MetricsLogger(writer)
@@ -583,6 +665,7 @@ def main():
     
     # Training
     best_task_acc = 0
+    best_cell_acc = 0
     global_step = 0
     
     for epoch in range(num_epochs):
@@ -590,52 +673,86 @@ def main():
         
         train_loss, train_cell_acc, train_task_acc, global_step = train_epoch(
             model, train_loader, optimizer, device, global_step,
-            logger=logger, log_interval=10,
+            logger=logger, 
+            log_interval=10,
             temperature=temperature,
+            grad_accum_steps=grad_accum_steps,
+            visualize_interval=50,
         )
         
         logger.log_epoch(epoch, train_loss, train_cell_acc, train_task_acc)
         
-        # Evaluate every 5 epochs
-        if (epoch + 1) % 5 == 0:
+        # Evaluate every 5 epochs (or every epoch for debug)
+        eval_interval = 1 if preset_name == "debug" else 5
+        if (epoch + 1) % eval_interval == 0:
             eval_cell_acc, eval_task_acc = evaluate(
                 model, eval_loader, device,
-                global_step=global_step, visualize_samples=2,
-                use_generation=False,  # Teacher forcing for speed
+                global_step=global_step, 
+                visualize_samples=2,
+                use_generation=True,  # Use autoregressive generation
+                logger=logger,
             )
             
-            if eval_task_acc > best_task_acc or (eval_task_acc == 0 and best_task_acc == 0 and epoch == 4):
-                best_task_acc = max(eval_task_acc, best_task_acc)
-                torch.save(model.state_dict(), log_dir / "best_model.pt")
-                print(f"  → Saved best model (task_acc={eval_task_acc:.3f})")
+            # Save best model
+            if eval_task_acc > best_task_acc or (eval_task_acc == best_task_acc and eval_cell_acc > best_cell_acc):
+                best_task_acc = eval_task_acc
+                best_cell_acc = eval_cell_acc
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_task_acc': best_task_acc,
+                    'best_cell_acc': best_cell_acc,
+                }, log_dir / "best_model.pt")
+                print(f"  → Saved best model (task={eval_task_acc:.3f}, cell={eval_cell_acc:.3f})")
             
             logger.log_epoch(epoch, train_loss, train_cell_acc, train_task_acc,
                             eval_cell_acc=eval_cell_acc, eval_task_acc=eval_task_acc)
             
-            print(f"Epoch {epoch+1:3d} | Loss: {train_loss:.4f} | Eval Task: {eval_task_acc:.3f} | Best: {best_task_acc:.3f} | τ: {temperature:.2f}")
+            print(f"Epoch {epoch+1:3d}/{num_epochs} | Loss: {train_loss:.4f} | "
+                  f"Eval Task: {eval_task_acc:.3f} | Eval Cell: {eval_cell_acc:.3f} | "
+                  f"Best: {best_task_acc:.3f} | τ: {temperature:.2f}")
         else:
-            print(f"Epoch {epoch+1:3d} | Loss: {train_loss:.4f} | Train Task: {train_task_acc:.3f} | τ: {temperature:.2f}")
+            print(f"Epoch {epoch+1:3d}/{num_epochs} | Loss: {train_loss:.4f} | "
+                  f"Train Task: {train_task_acc:.3f} | Train Cell: {train_cell_acc:.3f} | "
+                  f"τ: {temperature:.2f}")
+        
+        # Checkpoint every 20 epochs
+        if (epoch + 1) % 20 == 0:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            }, log_dir / f"checkpoint_epoch{epoch+1}.pt")
     
     # Final evaluation with autoregressive generation
-    print("\n" + "="*60)
+    print("\n" + "="*70)
     print("Final evaluation with autoregressive generation...")
-    print("="*60)
+    print("="*70)
     eval_cell_acc, eval_task_acc = evaluate(
         model, eval_loader, device,
-        global_step=global_step, visualize_samples=5,
-        use_generation=True,  # True autoregressive
+        global_step=global_step, 
+        visualize_samples=5,
+        use_generation=True,
+        logger=logger,
     )
     print(f"Autoregressive Eval: Cell={eval_cell_acc:.3f}, Task={eval_task_acc:.3f}")
     
     # Save final model
-    torch.save(model.state_dict(), log_dir / "final_model.pt")
+    torch.save({
+        'epoch': num_epochs,
+        'model_state_dict': model.state_dict(),
+        'final_task_acc': eval_task_acc,
+        'final_cell_acc': eval_cell_acc,
+    }, log_dir / "final_model.pt")
     print(f"  → Saved final model")
     
     logger.close()
-    print(f"\n{'='*60}")
-    print(f"Decoder + Cache Training Complete!")
+    print(f"\n{'='*70}")
+    print(f"Mini-ARC Decoder + Cache Training Complete!")
     print(f"Best task accuracy: {best_task_acc:.3f}")
-    print(f"{'='*60}")
+    print(f"Best cell accuracy: {best_cell_acc:.3f}")
+    print(f"{'='*70}")
 
 
 if __name__ == "__main__":

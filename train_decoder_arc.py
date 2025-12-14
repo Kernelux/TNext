@@ -289,14 +289,23 @@ def visualize_sample(
     lines.append(f"[Step {step}] ARC-AGI-2 Task: {task_id} (Sample #{sample_idx})")
     
     if aux:
-        read_gates = aux.get('read_gates', [])
-        write_gates = aux.get('write_gates', [])
-        if read_gates:
-            avg_read = sum(g.detach().mean().item() for g in read_gates) / len(read_gates)
-            lines.append(f"  Avg Read Gate: {avg_read:.3f}")
-        if write_gates:
-            avg_write = sum(g.detach().mean().item() for g in write_gates) / len(write_gates)
-            lines.append(f"  Avg Write Gate: {avg_write:.3f}")
+        ltm_read = aux.get('ltm_read_gates', [])
+        ltm_write = aux.get('ltm_write_gates', [])
+        wm_read = aux.get('wm_read_gates', [])
+        wm_write = aux.get('wm_write_gates', [])
+        
+        if ltm_read:
+            avg_read = sum(g.detach().mean().item() for g in ltm_read) / len(ltm_read)
+            lines.append(f"  Avg LTM Read: {avg_read:.3f}")
+        if ltm_write:
+            avg_write = sum(g.detach().mean().item() for g in ltm_write) / len(ltm_write)
+            lines.append(f"  Avg LTM Write: {avg_write:.3f}")
+        if wm_read:
+            avg_read = sum(g.detach().mean().item() for g in wm_read) / len(wm_read)
+            lines.append(f"  Avg WM Read: {avg_read:.3f}")
+        if wm_write:
+            avg_write = sum(g.detach().mean().item() for g in wm_write) / len(wm_write)
+            lines.append(f"  Avg WM Write: {avg_write:.3f}")
     
     lines.append(f"{'='*70}")
     
@@ -403,8 +412,9 @@ def compute_decoder_loss(
     read_target = 0.4
     write_target = 0.3
     
-    read_gates = aux.get('read_gates', [])
-    write_gates = aux.get('write_gates', [])
+    # Use LTM gates for regularization
+    read_gates = aux.get('ltm_read_gates', [])
+    write_gates = aux.get('ltm_write_gates', [])
     
     if read_gates:
         # Calculate averages
@@ -448,7 +458,7 @@ def train_epoch(
     log_interval: int = 10,
     temperature: float = 1.0,
     grad_accum_steps: int = 1,
-    visualize_interval: int = 100,
+    visualize_interval: int = 50,
 ) -> Tuple[float, float, float, int]:
     """Training epoch with teacher forcing and gradient accumulation."""
     model.train()
@@ -486,8 +496,8 @@ def train_epoch(
         
         # Optimizer step after accumulation
         if (batch_idx + 1) % grad_accum_steps == 0:
-            # Gradient clipping
-            #torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # Gradient clipping - essential for stability
+            #clip_grad_norm_(model.parameters(), 1.0)
             
             # Check for NaN
             has_nan = any(
@@ -508,44 +518,86 @@ def train_epoch(
         
         # Metrics
         preds = logits.detach().argmax(dim=-1)
+        
+        # Batch-level metrics (for logging)
+        batch_correct_cells = 0
+        batch_total_cells = 0
+        batch_correct_tasks = 0
+        batch_total_tasks = 0
+
         for i in range(preds.shape[0]):
             valid_mask = (test_output[i] != IGNORE_LABEL) & (test_output[i] != EOS_TOKEN)
             if valid_mask.any():
-                correct_cells += (preds[i][valid_mask] == test_output[i][valid_mask]).sum().item()
-                total_cells += valid_mask.sum().item()
+                # Calculate correct cells for this sample
+                correct = (preds[i][valid_mask] == test_output[i][valid_mask]).sum().item()
+                total = valid_mask.sum().item()
+                
+                # Update Cumulative (Epoch) stats
+                correct_cells += correct
+                total_cells += total
+                
+                # Update Batch stats
+                batch_correct_cells += correct
+                batch_total_cells += total
+                
                 if (preds[i][valid_mask] == test_output[i][valid_mask]).all():
                     correct_tasks += 1
+                    batch_correct_tasks += 1
+            
             total_tasks += 1
+            batch_total_tasks += 1
         
+        # Cumulative (Epoch) Accuracy - for Progress Bar
         cell_acc = correct_cells / max(total_cells, 1)
         task_acc = correct_tasks / max(total_tasks, 1)
         
+        # Batch Accuracy - for TensorBoard Logging (Instantaneous)
+        batch_cell_acc = batch_correct_cells / max(batch_total_cells, 1)
+        batch_task_acc = batch_correct_tasks / max(batch_total_tasks, 1)
+        
         # Logging
         if logger is not None and batch_idx % log_interval == 0:
-            read_gates = aux.get('read_gates', [])
-            write_gates = aux.get('write_gates', [])
+            # Extract gates
+            ltm_read_gates = aux.get('ltm_read_gates', [])
+            ltm_write_gates = aux.get('ltm_write_gates', [])
+            wm_read_gates = aux.get('wm_read_gates', [])
+            wm_write_gates = aux.get('wm_write_gates', [])
+            wm_validity = aux.get('wm_validity', [])
             
             log_aux = {'passes_run': 1}
             
-            if read_gates:
-                read_sum = sum(g.sum().detach().item() for g in read_gates)
-                read_count = sum(g.numel() for g in read_gates)
-                log_aux['read_gate_sum'] = read_sum
-                log_aux['read_gate_count'] = read_count
+            # Helper to get read/write RATE as percentage (0-100%)
+            # Gates are [B, S, 1] with values 0-1, mean gives % of tokens that read/wrote
+            def get_gate_rate(gates):
+                if not gates: return 0.0
+                # Average gate value across all tokens, batch, and layers -> 0-1
+                # Multiply by 100 for percentage
+                total_mean = sum(g.detach().mean().item() for g in gates) / len(gates)
+                return total_mean * 100  # As percentage
             
-            if write_gates:
-                write_sum = sum(g.sum().detach().item() for g in write_gates)
-                write_count = sum(g.numel() for g in write_gates)
-                log_aux['write_gate_sum'] = write_sum
-                log_aux['write_gate_count'] = write_count
+            if ltm_read_gates:
+                log_aux['ltm_read_rate'] = get_gate_rate(ltm_read_gates)  # % of tokens reading from LTM
+            if ltm_write_gates:
+                log_aux['ltm_write_rate'] = get_gate_rate(ltm_write_gates)  # % of tokens writing to LTM
+            if wm_read_gates:
+                log_aux['wm_read_rate'] = get_gate_rate(wm_read_gates)  # % of tokens reading from WM
+            if wm_write_gates:
+                log_aux['wm_write_rate'] = get_gate_rate(wm_write_gates)  # % of tokens writing to WM
+            
+            if wm_validity:
+                # wm_validity is list of [B, K] with validity values (0 or 1)
+                # Compute % of slots that are valid (have data)
+                all_valid = torch.cat([v.flatten() for v in wm_validity])
+                pct_occupied = all_valid.mean().item() * 100  # % of WM slots occupied
+                log_aux['wm_slots_occupied_pct'] = pct_occupied  # % of WM slots with data
             
             logger.log_step(
                 step=global_step,
                 metrics=metrics,
                 aux=log_aux,
                 config=None,
-                cell_acc=cell_acc,
-                task_acc=task_acc,
+                cell_acc=batch_cell_acc,
+                task_acc=batch_task_acc,
             )
         
         # Visualization
@@ -602,7 +654,7 @@ def train_epoch(
     
     # Handle remaining gradients
     if (len(dataloader) % grad_accum_steps) != 0:
-        #torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        #clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad()
         total_loss += accum_loss * grad_accum_steps
@@ -740,21 +792,50 @@ def print_model_summary(model: torch.nn.Module):
 # ============================================================================
 
 def main():
-    import sys
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train Decoder+Cache on ARC-AGI-2")
+    parser.add_argument("preset", nargs="?", default="fast", help="debug|fast|medium|fast_full|full")
+    # WTA vs blend for write collision resolution (DLSM v0.1.1)
+    # READ: always blends relevant slots (standard attention)
+    # WRITE: soft slot routing + collision resolution toggle
+    parser.add_argument("--ltm-wta", action="store_true", help="Use winner-take-all for LTM write collisions (default: blend)")
+    parser.add_argument("--wm-blend", action="store_true", help="Use blended writes for WM collisions (default: WTA)")
     
+    # Feature flags for ablation studies
+    parser.add_argument("--no-ltm", action="store_true", help="Disable Long-Term Memory (LTM)")
+    parser.add_argument("--no-wm", action="store_true", help="Disable Working Memory (WM)")
+    parser.add_argument("--no-consolidation", action="store_true", help="Disable Memory Consolidation")
+    parser.add_argument("--no-causal-latent", action="store_true", help="Disable Causal Latent Bank")
+    
+    args = parser.parse_args()
+
     # Data path
     data_dir = "./ARC-AGI-2/data"
     
     # Device
     device = torch.device(
+        
         'mps' if torch.backends.mps.is_available() else
         'cuda' if torch.cuda.is_available() else 'cpu'
     )
     print(f"Using device: {device}")
     
     # Preset
-    preset_name = sys.argv[1] if len(sys.argv) > 1 else "fast"
+    preset_name = args.preset
+    ltm_wta_write = 'blend' # 'WTA' #args.ltm_wta
+    wm_wta_write = 'blend' #not args.wm_blend
+    
+    # Feature flags
+    use_ltm = not args.no_ltm
+    use_wm = not args.no_wm
+    use_consolidation = not args.no_consolidation
+    use_causal_latent = not args.no_causal_latent
+
     print(f"\nUsing preset: '{preset_name}'")
+    print(f"LTM write collision: {'WTA' if ltm_wta_write else 'blend'}")
+    print(f"WM write collision: {'WTA' if wm_wta_write else 'blend'}")
+    print(f"Features: LTM={use_ltm}, WM={use_wm}, Consolidation={use_consolidation}, CausalLatent={use_causal_latent}")
     
     # Model configuration per preset
     # ARC-AGI-2 needs larger model due to 30x30 grids (900 tokens vs 25)
@@ -765,6 +846,7 @@ def main():
     if preset_name == "debug":
         d_model, d_cache = 64, 32
         num_layers, num_slots = 3, 16
+        num_working_memory_slots = 16
         kernel_size, num_conv_layers = 5, 2
         batch_size = 2
         num_epochs = 5
@@ -796,12 +878,13 @@ def main():
         # batch_size = 1
         # num_epochs = 100
         # lr = 1e-4
-        d_model, d_cache = 32, 16
-        num_layers, num_slots = 5, 32  # Increased slots from 32 to 192
-        kernel_size, num_conv_layers = 3, 5
-        batch_size = 4
+        d_model, d_cache = 16, 16
+        num_layers, num_slots = 5, 32
+        num_working_memory_slots = 16
+        kernel_size, num_conv_layers = 3, 3
+        batch_size = 8
         num_epochs = 100
-        lr = 1e-3
+        lr = 1e-4
         eval_split_ratio = 0.9
         grad_accum_steps = 1
         soft_eviction = True
@@ -868,12 +951,19 @@ def main():
         d_model=d_model,
         d_cache=d_cache,
         num_layers=num_layers,
-        num_slots=num_slots,
+        num_slots=num_slots, #LTM slots
         kernel_size=kernel_size,
         num_conv_layers_per_block=num_conv_layers,
         max_seq_len=actual_max_seq_len,
         #dropout=0.1,  # Regularization for larger dataset
         soft_eviction=soft_eviction,
+        ltm_wta_write=ltm_wta_write,
+        wm_wta_write=wm_wta_write,
+        num_wm_slots=num_working_memory_slots,
+        use_ltm=use_ltm,
+        use_wm=use_wm,
+        use_consolidation=use_consolidation,
+        use_causal_latent=use_causal_latent,
     ).to(device)
     
     print_model_summary(model)
@@ -919,7 +1009,7 @@ def main():
             log_interval=10,
             temperature=temperature,
             grad_accum_steps=grad_accum_steps,
-            visualize_interval=200,
+            visualize_interval=50,
         )
         
         # Step scheduler
@@ -935,7 +1025,7 @@ def main():
                 model, eval_loader, device,
                 global_step=global_step, 
                 visualize_samples=2,
-                use_generation=False,
+                use_generation=True,  # Use autoregressive generation now that it's fast
                 logger=logger,
             )
             

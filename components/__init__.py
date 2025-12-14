@@ -14,6 +14,13 @@ from .memory_controller import (
     ModelHaltEstimator,   # Model-level halting (entropy-based)
 )
 from .volatile_memory import VolatileMemoryController
+from .shared_memory import (
+    SharedLTMProjections,
+    SharedWMProjections,
+    LightweightMemoryOps,
+    EfficientMemoryController,
+    EfficientVolatileMemory,
+)
 from .unified_layer import UnifiedMemoryLayer, ComputeBlock
 from .recursive_refinement_model import RecursiveRefinementModel
 from .cnn_cache_model import CNNCacheModel, create_cnn_cache_model

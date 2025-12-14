@@ -44,6 +44,151 @@ from .memory_controller import MemoryController, LayerHaltEstimator
 from .modules import LinearAttention, CosSin, CacheSelfAttention
 
 
+# class UnifiedMemoryConsolidator(nn.Module):
+#     """
+#     Unified Workspace Consolidation for LTM and WM.
+    
+#     Concatenates LTM and WM slots into a single workspace, runs self-attention,
+#     and then splits them back. This allows:
+#     1. LTM to attend to WM (absorb new info)
+#     2. WM to attend to LTM (retrieve global rules)
+#     3. LTM/WM to self-consolidate
+    
+#     Handles heterogeneous slot dimensions by projecting to a common dimension.
+#     """
+    
+#     def __init__(
+#         self,
+#         d_cache: int,
+#         d_model: int, # Common dimension for attention
+#         num_heads: int = 4,
+#         dropout: float = 0.1,
+#     ):
+#         super().__init__()
+#         self.d_cache = d_cache
+#         self.d_model = d_model
+        
+#         # Slot dimensions
+#         self.d_ltm_slot = SLOT_DIMS.d_slot(d_cache)
+#         self.d_wm_slot = d_cache + 1 # content + freshness
+        
+#         # Projections to common dimension
+#         self.ltm_proj = nn.Linear(self.d_ltm_slot, d_model)
+#         self.wm_proj = nn.Linear(self.d_wm_slot, d_model)
+        
+#         # Projections back to slot dimensions
+#         # We only update CONTENT, preserving metadata (confidence/freshness/temporal)
+#         # actually, we might want to update confidence/freshness too?
+#         # For now, let's update the whole slot but we need to be careful about metadata semantics.
+#         # Better approach: Update content, and maybe gate the update?
+#         # Let's project back to full slot dim and let the model learn to update metadata if needed.
+#         self.ltm_out = nn.Linear(d_model, self.d_ltm_slot)
+#         self.wm_out = nn.Linear(d_model, self.d_wm_slot)
+        
+#         # Self-Attention
+#         self.attn = nn.MultiheadAttention(
+#             embed_dim=d_model,
+#             num_heads=num_heads,
+#             dropout=dropout,
+#             batch_first=True
+#         )
+        
+#         # Consolidation MLP (shared)
+#         self.norm1 = nn.LayerNorm(d_model)
+#         self.norm2 = nn.LayerNorm(d_model)
+#         self.mlp = nn.Sequential(
+#             nn.Linear(d_model, d_model * 4),
+#             nn.GELU(),
+#             nn.Linear(d_model * 4, d_model),
+#             nn.Dropout(dropout)
+#         )
+        
+#         self._init_weights()
+        
+#     def _init_weights(self):
+#         nn.init.xavier_uniform_(self.ltm_proj.weight)
+#         nn.init.zeros_(self.ltm_proj.bias)
+#         nn.init.xavier_uniform_(self.wm_proj.weight)
+#         nn.init.zeros_(self.wm_proj.bias)
+#         nn.init.xavier_uniform_(self.ltm_out.weight)
+#         nn.init.zeros_(self.ltm_out.bias)
+#         nn.init.xavier_uniform_(self.wm_out.weight)
+#         nn.init.zeros_(self.wm_out.bias)
+        
+#         # Init MLP
+#         for m in self.mlp.modules():
+#             if isinstance(m, nn.Linear):
+#                 nn.init.xavier_uniform_(m.weight)
+#                 if m.bias is not None:
+#                     nn.init.zeros_(m.bias)
+        
+#         nn.init.ones_(self.norm1.weight)
+#         nn.init.zeros_(self.norm1.bias)
+#         nn.init.ones_(self.norm2.weight)
+#         nn.init.zeros_(self.norm2.bias)
+
+#     def forward(
+#         self,
+#         cache: torch.Tensor, # [B, N_ltm, D_ltm]
+#         wm: torch.Tensor,    # [B, N_wm, D_wm]
+#     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+#         B = cache.shape[0]
+#         N_ltm = cache.shape[1]
+#         N_wm = wm.shape[1]
+        
+#         # 1. Project to common dimension
+#         h_ltm = self.ltm_proj(cache) # [B, N_ltm, D_model]
+#         h_wm = self.wm_proj(wm)      # [B, N_wm, D_model]
+        
+#         # 2. Concatenate
+#         h = torch.cat([h_ltm, h_wm], dim=1) # [B, N_ltm + N_wm, D_model]
+        
+#         # 3. Create Mask for Stale WM slots
+#         # WM freshness is the last element
+#         wm_freshness = wm[..., -1] # [B, N_wm]
+#         # Mask if freshness < threshold (e.g. 0.1)
+#         # True = Blocked (ignored)
+#         wm_mask = (wm_freshness < 0.1) # [B, N_wm]
+        
+#         # LTM is always valid (no mask)
+#         ltm_mask = torch.zeros(B, N_ltm, dtype=torch.bool, device=cache.device)
+        
+#         # Combined mask [B, N_ltm + N_wm]
+#         mask = torch.cat([ltm_mask, wm_mask], dim=1)
+        
+#         # Expand mask for MultiheadAttention: [B, 1, 1, S] or [B * H, Q, S]?
+#         # MHA expects key_padding_mask as [B, S] where True is ignored.
+#         # This fits perfectly.
+        
+#         # 4. Self-Attention
+#         residual = h
+#         h = self.norm1(h)
+#         attn_out, _ = self.attn(h, h, h, key_padding_mask=mask)
+#         h = residual + attn_out
+        
+#         # 5. MLP
+#         residual = h
+#         h = self.norm2(h)
+#         h = self.mlp(h)
+#         h = residual + h
+        
+#         # 6. Split
+#         h_ltm_new = h[:, :N_ltm, :]
+#         h_wm_new = h[:, N_ltm:, :]
+        
+#         # 7. Project back and Residual Update
+#         # We add the *change* to the original slots (residual connection in slot space)
+#         # This preserves the original metadata scale/semantics while adding new info
+#         delta_ltm = self.ltm_out(h_ltm_new)
+#         delta_wm = self.wm_out(h_wm_new)
+        
+#         updated_cache = cache + delta_ltm
+#         updated_wm = wm + delta_wm
+        
+#         return updated_cache, updated_wm
+
+
 class ComputeBlock(nn.Module):
     """
     Standard computation block (Transformer-style).

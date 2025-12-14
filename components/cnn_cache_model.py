@@ -89,6 +89,63 @@ class CausalConv1d(nn.Module):
         x = F.pad(x, (self.padding, 0))
         return self.conv(x)
 
+    def forward_chunk(self, x: torch.Tensor, state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass for a chunk, using state for padding.
+        
+        Args:
+            x: [B, C, S] input chunk
+            state: [B, C, padding] buffer from previous chunk
+        
+        Returns:
+            output: [B, C_out, S]
+            new_state: [B, C, padding] updated buffer
+        """
+        if state is None:
+            # First chunk: use zero padding
+            x_padded = F.pad(x, (self.padding, 0))
+        else:
+            # Subsequent chunks: use state as padding
+            x_padded = torch.cat([state, x], dim=2)
+            
+        out = self.conv(x_padded)
+        
+        # Update state: last 'padding' elements of input
+        if self.padding > 0:
+            new_state = x_padded[:, :, -self.padding:]
+        else:
+            new_state = torch.zeros(x.shape[0], x.shape[1], 0, device=x.device)
+            
+        return out, new_state
+
+    def forward_step(self, x: torch.Tensor, state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Incremental forward step.
+        
+        Args:
+            x: [B, C, 1] input
+            state: [B, C, padding] buffer of previous inputs
+            
+        Returns:
+            output: [B, C_out, 1]
+            new_state: [B, C, padding] updated buffer
+        """
+        if state is None:
+            # Initialize with zeros if no state provided
+            state = torch.zeros(x.shape[0], x.shape[1], self.padding, device=x.device)
+            
+        # Input to conv: [B, C, padding + 1] (history + current)
+        conv_input = torch.cat([state, x], dim=2)
+        
+        # Apply conv - output will be [B, C_out, 1] because input size is exactly kernel effective size
+        out = self.conv(conv_input)
+        
+        # Update state: shift left and add new input (discard oldest)
+        # New state is the last 'padding' elements of conv_input
+        new_state = conv_input[:, :, 1:]
+        
+        return out, new_state
+
 
 class ConvBlock(nn.Module):
     """
@@ -164,6 +221,68 @@ class ConvBlock(nn.Module):
         x = x.transpose(1, 2)
 
         return x + residual  # HIGH-D residual connection
+
+    def forward_chunk(self, x: torch.Tensor, state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass for a chunk, maintaining padding state.
+        
+        Args:
+            x: [B, S, D] input chunk
+            state: [B, D, padding] buffer from previous chunk
+        
+        Returns:
+            output: [B, S, D]
+            new_state: [B, D, padding] updated buffer
+        """
+        residual = x
+        x = self.norm(x)
+        x = x.transpose(1, 2) # [B, D, S]
+        
+        # Apply DW conv with state
+        x, new_state = self.dw_conv.forward_chunk(x, state)
+        
+        x = self.act(x)
+        x = self.compress(x)
+        x = self.act(x)
+        x = self.expand(x)
+        x = self.dropout(x)
+
+        x = x.transpose(1, 2) # [B, S, D]
+
+        return x + residual, new_state
+
+    def forward_step(self, x: torch.Tensor, state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Incremental forward step.
+        
+        Args:
+            x: [B, 1, D] input
+            state: State for dw_conv
+            
+        Returns:
+            output: [B, 1, D]
+            new_state: Updated state
+        """
+        residual = x
+        
+        # LayerNorm
+        x = self.norm(x)
+        
+        # Transpose to [B, D, 1]
+        x = x.transpose(1, 2)
+        
+        # Sandglass: DW on high-D → compress → expand
+        x, new_state = self.dw_conv.forward_step(x, state)
+        x = self.act(x)
+        x = self.compress(x)
+        x = self.act(x)
+        x = self.expand(x)
+        x = self.dropout(x)
+        
+        # Back to [B, 1, D]
+        x = x.transpose(1, 2)
+        
+        return x + residual, new_state
 
 
 class CausalLatentBank(nn.Module):
@@ -328,6 +447,53 @@ class CausalLatentBank(nn.Module):
         # Scale by learnable alpha (starts at 0)
         return output * self.alpha
     
+    def forward_chunk(self, x: torch.Tensor, state: Tuple[torch.Tensor, int]) -> Tuple[torch.Tensor, Tuple[torch.Tensor, int]]:
+        """
+        Forward pass for a chunk of the sequence, maintaining state.
+        
+        Args:
+            x: [B, S, D] input chunk
+            state: (cum_values, count) from previous chunk
+                   cum_values: [B, D]
+                   count: int
+        
+        Returns:
+            output: [B, S, D]
+            new_state: (new_cum_values, new_count)
+        """
+        B, S, D = x.shape
+        cum_values_prev, count_prev = state
+        
+        # 1. Project input to value space
+        values = self.value_proj(x)  # [B, S, D]
+        
+        # 2. Compute causal cumulative average
+        # Add previous cumulative sum
+        cum_values = torch.cumsum(values, dim=1) + cum_values_prev.unsqueeze(1) # [B, S, D]
+        
+        # Counts
+        counts = torch.arange(count_prev + 1, count_prev + S + 1, device=x.device, dtype=x.dtype).view(1, -1, 1)
+        avg_values = cum_values / counts  # [B, S, D]
+        
+        # 3. Project average through K different "lenses"
+        queries = self.query_proj(x)  # [B, S, D]
+        slot_keys = self.slot_init  # [K, D]
+        
+        scores = torch.matmul(queries, slot_keys.T) / math.sqrt(D)  # [B, S, K]
+        weights = F.softmax(scores, dim=-1)  # [B, S, K]
+        
+        slot_context = torch.einsum('bsk,kd->bsd', weights, self.slot_init)  # [B, S, D]
+        context = avg_values + slot_context
+        
+        # 4. Output projection
+        output = self.out_proj(context)
+        
+        # Update state
+        new_cum_values = cum_values[:, -1, :] # [B, D]
+        new_count = count_prev + S
+        
+        return output * self.alpha, (new_cum_values, new_count)
+
     def forward_step(self, x_t: torch.Tensor, cum_values: torch.Tensor, count: int):
         """
         Incremental forward for autoregressive inference.
@@ -397,14 +563,143 @@ class DilatedConvStack(nn.Module):
         kernel_size: int = 3,
         dropout: float = 0.1,
         num_latent_slots: int = 32,  # Number of latent slots (K)
+        use_causal_latent: bool = True,
     ):
         super().__init__()
+        self.use_causal_latent = use_causal_latent
 
         # 1. The Global Context Branch: Causal Latent Bank (SHARED)
         # Single latent bank applied once before CNN stack
         # This is more efficient than per-layer banks
-        self.global_branch = CausalLatentBank(d_model, num_slots=num_latent_slots, dropout=dropout)
+        if self.use_causal_latent:
+            self.global_branch = CausalLatentBank(d_model, num_slots=num_latent_slots, dropout=dropout)
+        else:
+            self.global_branch = None
 
+        # 2. The Local CNN Branch (The "Microscope")
+        self.layers = nn.ModuleList([
+            ConvBlock(
+                d_model=d_model,
+                kernel_size=kernel_size,
+                dilation=2**i,  # Exponential dilation
+                dropout=dropout,
+            )
+            for i in range(num_layers)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, S, D] input
+        Returns:
+            [B, S, D] output with large receptive field + latent bank context
+            
+        Flow:
+            1. Query Causal Latent Bank for global context (O(S × K))
+            2. Inject context into features
+            3. Apply dilated CNN stack for local patterns
+        """
+        # 1. Global context from latent bank (applied once)
+        if self.use_causal_latent and self.global_branch is not None:
+            x_global = self.global_branch(x) 
+            x = x + x_global  # Add slot-derived context
+        
+        # 2. Apply CNN stack
+        for layer in self.layers:
+            x = layer(x)  # Dilated convolution for local patterns
+            
+        return x
+
+    def forward_chunk(self, x: torch.Tensor, state: Optional[Dict] = None) -> Tuple[torch.Tensor, Dict]:
+        """
+        Forward pass for a chunk, maintaining states for all layers.
+        
+        Args:
+            x: [B, S, D] input chunk
+            state: Dict containing states for global_branch and layers
+        
+        Returns:
+            output: [B, S, D]
+            new_state: Dict
+        """
+        if state is None:
+            # Initialize states
+            # global_branch state: (cum_values, count)
+            # cum_values: [B, D], count: int
+            B, S, D = x.shape
+            device = x.device
+            global_state = (torch.zeros(B, D, device=device), 0)
+            layer_states = [None] * len(self.layers)
+        else:
+            global_state = state['global']
+            layer_states = state['layers']
+            
+        # 1. Global context from latent bank
+        if self.use_causal_latent and self.global_branch is not None:
+            x_global, new_global_state = self.global_branch.forward_chunk(x, global_state)
+            x = x + x_global
+        else:
+            new_global_state = global_state
+        
+        # 2. Apply CNN stack
+        new_layer_states = []
+        for i, layer in enumerate(self.layers):
+            x, new_layer_state = layer.forward_chunk(x, layer_states[i])
+            new_layer_states.append(new_layer_state)
+            
+        new_state = {
+            'global': new_global_state,
+            'layers': new_layer_states
+        }
+        
+        return x, new_state
+
+    def forward_step(
+        self, 
+        x: torch.Tensor, 
+        states: Optional[List[torch.Tensor]] = None, 
+        global_state: Optional[Tuple] = None
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], Tuple]:
+        """
+        Incremental forward step.
+        
+        Args:
+            x: [B, 1, D] input
+            states: List of states for each ConvBlock
+            global_state: State for CausalLatentBank (cum_values, count)
+            
+        Returns:
+            output: [B, 1, D]
+            new_states: Updated states for ConvBlocks
+            new_global_state: Updated global state
+        """
+        if states is None:
+            states = [None] * len(self.layers)
+            
+        # 1. Global context from latent bank
+        if self.use_causal_latent and self.global_branch is not None:
+            if global_state is None:
+                cum_values, count = self.global_branch.get_initial_state(x.shape[0], x.device)
+            else:
+                cum_values, count = global_state
+                
+            # x is [B, 1, D], squeeze for global branch [B, D]
+            x_flat = x.squeeze(1)
+            x_global, new_cum_values, new_count = self.global_branch.forward_step(x_flat, cum_values, count)
+            new_global_state = (new_cum_values, new_count)
+            
+            # Add global context
+            x = x + x_global.unsqueeze(1)
+        else:
+            new_global_state = global_state
+        
+        # 2. Apply CNN stack
+        new_states = []
+        for i, layer in enumerate(self.layers):
+            x, new_state = layer.forward_step(x, states[i])
+            new_states.append(new_state)
+            
+        return x, new_states, new_global_state
         # 2. The Local CNN Branch (The "Microscope")
         self.layers = nn.ModuleList([
             ConvBlock(

@@ -40,6 +40,7 @@ class MetricsLogger:
         self._log_accuracy(step, cell_acc, task_acc)
         self._log_compute_stats(step, aux, config)
         self._log_gates(step, aux, metrics)
+        self._log_memory_stats(step, aux)
         self._log_confidence(step, aux)
         self._log_entropy(step, aux)
         self._log_q_halt(step, aux, metrics)
@@ -154,6 +155,17 @@ class MetricsLogger:
         if aux.get('iteration_feedback_count', 0) > 0:
             avg_fb = aux['iteration_feedback_sum'] / aux['iteration_feedback_count']
             self._log('Feedback/iteration_gate_mean', avg_fb, step)
+
+    def _log_memory_stats(self, step: int, aux: Dict):
+        """Log memory usage statistics."""
+        # Read/write rates as percentages (0-100%)
+        self._log('Memory/LTM_read_rate_pct', aux.get('ltm_read_rate'), step)
+        self._log('Memory/LTM_write_rate_pct', aux.get('ltm_write_rate'), step)
+        self._log('Memory/WM_read_rate_pct', aux.get('wm_read_rate'), step)
+        self._log('Memory/WM_write_rate_pct', aux.get('wm_write_rate'), step)
+        # WM fullness metrics
+        self._log('Memory/WM_slots_active_pct', aux.get('wm_slots_active_pct'), step)
+        self._log('Memory/WM_avg_freshness_pct', aux.get('wm_avg_freshness_pct'), step)
     
     def _log_confidence(self, step: int, aux: Dict):
         """Log confidence tracking."""
